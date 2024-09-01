@@ -1,15 +1,12 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-import numpy as np
-
-from transformers import BertModel
-from transformers.models.bert.modeling_bert import BertEncoder
 
 from tqdm import tqdm
 
-from .LRPBert import LRPBertModel, LRPBertEncoder, BERTXAIConfig
 from .LRPTensor import LRPTensor
+from ..LRPFactory import LRPFactory
+
 
 class LRPLayer(nn.Module):
     def __init__(self, layer):
@@ -40,19 +37,8 @@ class LRPLayer(nn.Module):
 
     @classmethod
     def wrap(cls, module):
-        if isinstance(module, (nn.ModuleList, nn.Sequential)):
-            for i, layer in enumerate(module):
-                module[i] = cls.wrap(layer)
-        elif isinstance(module, nn.Module) and not isinstance(module, LRPLayer):
-            if isinstance(module, BertEncoder):
-                module = LRPBertEncoder(config=BERTXAIConfig(), base_encoder=module)
-            elif isinstance(module, BertModel):
-                module = LRPBertModel(config=BERTXAIConfig(), base_model=module)
-            else:
-                module = cls(module)
-            for name, child in module.named_children():
-                setattr(module, name, cls.wrap(child))
-        return module
+        return LRPFactory.wrap(module)
+
 
 class LRPModel(nn.Module):
     def __init__(self, model):
