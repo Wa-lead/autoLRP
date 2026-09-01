@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autoLRP"
+version = "0.1.0"
+description = "Layer-wise relevance propagation on the PyTorch autograd graph"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Waleed Alasad" }]
+requires-python = ">=3.9"
+dependencies = ["torch>=2.1", "numpy"]
+keywords = [
+    "lrp", "layer-wise-relevance-propagation", "explainability", "xai",
+    "interpretability", "attribution", "pytorch",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.urls]
+Homepage = "https://github.com/Wa-lead/autoLRP"
+Repository = "https://github.com/Wa-lead/autoLRP"
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-randomly"]
+parity = ["zennit"]
+
+[tool.setuptools.packages.find]
+include = ["autoLRP*"]
