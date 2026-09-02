@@ -187,7 +187,7 @@ If you use autoLRP in your research, please cite it:
   author  = {Alasad, Waleed},
   title   = {autoLRP: Layer-wise Relevance Propagation on the PyTorch autograd graph},
   year    = {2026},
-  version = {0.1.1},
+  version = {0.1.2},
   url     = {https://github.com/Wa-lead/autoLRP}
 }
 ```
