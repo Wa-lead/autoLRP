@@ -205,8 +205,8 @@ def _draw_input_panel(ax, img, caption='Input'):
 
 
 def _draw_overlay_panel(ax, img, hmap, vmax, caption='Attribution overlay'):
-    ax.imshow(img)
-    im = ax.imshow(hmap, cmap=RELEVANCE_CMAP, alpha=0.65,
+    ax.imshow(img, alpha=0.4)                    # faint base so relevance dominates
+    im = ax.imshow(hmap, cmap=RELEVANCE_CMAP, alpha=0.8,
                    vmin=-vmax, vmax=vmax)
     _frame_panel(ax)
     ax.set_xlabel(caption, fontsize=10, color='#444444', labelpad=6)

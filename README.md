@@ -44,7 +44,7 @@ Notebooks: [VGG-16](examples/showcase/vision/01_vgg16.ipynb),
 [ViT-B/16](examples/showcase/vision/03_vit_b_16.ipynb)
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/image_classification.png?v=2" width="90%">
+  <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/image_classification.png?v=3" width="90%">
 </p>
 
 ### Next-token prediction
@@ -82,7 +82,7 @@ CLRP, [Gu et al. 2018](https://arxiv.org/abs/1812.02100).
 Notebook: [CLRP](examples/showcase/paper_impl/03_clrp_vgg16.ipynb)
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/clrp.png" width="95%">
+  <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/clrp.png?v=2" width="95%">
 </p>
 
 ### Attention rule variant (CP-LRP)
