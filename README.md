@@ -44,7 +44,7 @@ Notebooks: [VGG-16](examples/showcase/vision/01_vgg16.ipynb),
 [ViT-B/16](examples/showcase/vision/03_vit_b_16.ipynb)
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/image_classification.png" width="90%">
+  <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/image_classification.png?v=2" width="90%">
 </p>
 
 ### Next-token prediction
