@@ -117,7 +117,7 @@ Notebook: [attention presets](examples/showcase/extras/03_attention_fused_vs_dec
 pass already built:
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/pipeline.png" width="100%">
+  <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/pipeline.png?v=1" width="100%">
 </p>
 
 1. **wrap.** `autoLRP.tensor(x)` marks the input. A handful of ops (`add`,
