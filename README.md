@@ -116,15 +116,9 @@ Notebook: [attention presets](examples/showcase/extras/03_attention_fused_vs_dec
 `.lrp()` never rewrites your model. It works on the autograd graph the forward
 pass already built:
 
-```mermaid
-flowchart LR
-  A["autoLRP.tensor(x)"] --> B["forward pass<br/>(ops intercepted to<br/>save what rules need)"]
-  B --> C["walk<br/>graph to node plan"]
-  C --> D["analyze<br/>attach facts to nodes"]
-  D --> E["install<br/>one LRP rule per node"]
-  E --> F["backward<br/>relevance flows"]
-  F --> G["x.relevance"]
-```
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/pipeline.png" width="100%">
+</p>
 
 1. **wrap.** `autoLRP.tensor(x)` marks the input. A handful of ops (`add`,
    `sum`, `softmax`, fused attention, and a few more) are replaced by versions
@@ -134,10 +128,11 @@ flowchart LR
    ordered plan of nodes.
 3. **analyze.** Analyzers tag nodes with *facts*, for example which operand of
    an attention product is the softmax weights.
-4. **install.** Each node gets one hook that turns the incoming gradient into
-   relevance, chosen by the config from the node name or its facts.
-5. **backward.** One `backward` pass carries relevance to the wrapped input.
-   Whatever arrives there is `x.relevance`.
+4. **resolve.** Each node gets one rule, chosen by the config from a fact on the
+   node when it has one, otherwise from the node name.
+5. **backward.** One `backward` pass runs those rules as hooks that turn the
+   incoming gradient into relevance. Whatever reaches the wrapped input is
+   `x.relevance`.
 
 ## Configuration
 
