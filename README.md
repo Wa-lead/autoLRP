@@ -53,7 +53,7 @@ Notebooks: [VGG-16](examples/showcase/vision/01_vgg16.ipynb),
 next word.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/gpt2_france.png" width="70%">
+  <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/gpt2_rose.png" width="75%">
 </p>
 
 ### Sentiment
