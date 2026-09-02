@@ -34,38 +34,32 @@ Links: [PyPI](https://pypi.org/project/autoLRP/) ·
 
 ## Examples
 
-Every figure below is produced by a notebook in
-[`examples/showcase`](examples/showcase). The input is wrapped, the model runs
-untouched, and `.lrp()` fills `.relevance`.
+A few of the notebooks in [`examples/showcase`](examples/showcase). Each wraps
+the input, runs the model untouched, and reads `.relevance` back.
 
-### Image classification (VGG-16, ViT-B/16)
+### Image classification
 
-The same image through a CNN and a vision transformer: relevance on the pixels
-that drive the *tiger shark* class, from the same three lines of code.
-
+Pixels behind the predicted class, across a CNN and a transformer.
 Notebooks: [VGG-16](examples/showcase/vision/01_vgg16.ipynb),
 [ViT-B/16](examples/showcase/vision/03_vit_b_16.ipynb)
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/vgg16_shark.png" width="49%">
-  <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/vit_shark.png" width="49%">
+  <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/image_classification.png" width="90%">
 </p>
 
-### Next-token prediction (GPT-2)
+### Next-token prediction
 
-Which context tokens drive the next word.
-
-Notebook: [GPT-2](examples/showcase/language/01_gpt2.ipynb)
+[GPT-2](examples/showcase/language/01_gpt2.ipynb): context tokens behind the
+next word.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/gpt2_france.png" width="70%">
 </p>
 
-### Sentiment (BERT)
+### Sentiment
 
-Which words carry the sentiment decision.
-
-Notebook: [BERT sentiment](examples/showcase/language/07_bert_sentiment.ipynb)
+[BERT](examples/showcase/language/07_bert_sentiment.ipynb): words behind the
+decision.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/bert_positive.png" width="90%">
@@ -73,10 +67,8 @@ Notebook: [BERT sentiment](examples/showcase/language/07_bert_sentiment.ipynb)
 
 ### Image similarity (BiLRP)
 
-Beyond single predictions: decompose the dot-product similarity of two VGG-16
-embeddings into the patch *pairs* that make the images look alike. Red pairs
-support the similarity, blue pairs oppose it.
-
+Attributing a *similarity* score to the patch pairs that make two images alike.
+BiLRP, [Eberle et al. 2020](https://arxiv.org/abs/2003.05431).
 Notebook: [BiLRP](examples/showcase/paper_impl/01_bilrp_vgg16.ipynb)
 
 <p align="center">
@@ -85,27 +77,22 @@ Notebook: [BiLRP](examples/showcase/paper_impl/01_bilrp_vgg16.ipynb)
 
 ### Contrastive attribution (CLRP)
 
-Separating two classes present in one image. Plain LRP for *zebra* and
-*elephant* highlights both animals; CLRP subtracts the shared evidence so each
-target keeps only what is distinctive to it.
-
+Isolating what is distinctive to each of two classes in one image.
+CLRP, [Gu et al. 2018](https://arxiv.org/abs/1812.02100).
 Notebook: [CLRP](examples/showcase/paper_impl/03_clrp_vgg16.ipynb)
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/clrp_zebra_elephant.png?v=1" width="90%">
+  <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/clrp.png" width="95%">
 </p>
 
 ### Attention rule variant (CP-LRP)
 
-One keyword changes how attention is propagated. `attn='cplrp'` treats the
-attention weights as constants (Ali et al. 2022) instead of propagating through
-them.
+One keyword switches the attention rule ([Ali et al. 2022](https://arxiv.org/abs/2202.07304)).
+Notebook: [attention presets](examples/showcase/extras/03_attention_fused_vs_decomposed.ipynb)
 
 ```python
 out[0, pred].lrp(config=LRPConfig(attn='cplrp'))
 ```
-
-Notebook: [attention presets](examples/showcase/extras/03_attention_fused_vs_decomposed.ipynb)
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/cplrp_bert.png" width="90%">
