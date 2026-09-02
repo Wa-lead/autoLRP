@@ -43,6 +43,9 @@ untouched, and `.lrp()` fills `.relevance`.
 The same image through a CNN and a vision transformer: relevance on the pixels
 that drive the *tiger shark* class, from the same three lines of code.
 
+Notebooks: [VGG-16](examples/showcase/vision/01_vgg16.ipynb),
+[ViT-B/16](examples/showcase/vision/03_vit_b_16.ipynb)
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/vgg16_shark.png" width="49%">
   <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/vit_shark.png" width="49%">
@@ -52,6 +55,8 @@ that drive the *tiger shark* class, from the same three lines of code.
 
 Which context tokens drive the next word.
 
+Notebook: [GPT-2](examples/showcase/language/01_gpt2.ipynb)
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/gpt2_france.png" width="70%">
 </p>
@@ -59,6 +64,8 @@ Which context tokens drive the next word.
 ### Sentiment (BERT)
 
 Which words carry the sentiment decision.
+
+Notebook: [BERT sentiment](examples/showcase/language/07_bert_sentiment.ipynb)
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/bert_positive.png" width="90%">
@@ -70,6 +77,8 @@ Beyond single predictions: decompose the dot-product similarity of two VGG-16
 embeddings into the patch *pairs* that make the images look alike. Red pairs
 support the similarity, blue pairs oppose it.
 
+Notebook: [BiLRP](examples/showcase/paper_impl/01_bilrp_vgg16.ipynb)
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/bilrp_cats.png" width="80%">
 </p>
@@ -79,6 +88,8 @@ support the similarity, blue pairs oppose it.
 Separating two classes present in one image. Plain LRP for *zebra* and
 *elephant* highlights both animals; CLRP subtracts the shared evidence so each
 target keeps only what is distinctive to it.
+
+Notebook: [CLRP](examples/showcase/paper_impl/03_clrp_vgg16.ipynb)
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/clrp_zebra_elephant.png?v=1" width="90%">
@@ -93,6 +104,8 @@ them.
 ```python
 out[0, pred].lrp(config=LRPConfig(attn='cplrp'))
 ```
+
+Notebook: [attention presets](examples/showcase/extras/03_attention_fused_vs_decomposed.ipynb)
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/cplrp_bert.png" width="90%">
