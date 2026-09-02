@@ -81,7 +81,7 @@ Separating two classes present in one image. Plain LRP for *zebra* and
 target keeps only what is distinctive to it.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/clrp_zebra_elephant.png" width="90%">
+  <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/clrp_zebra_elephant.png?v=1" width="90%">
 </p>
 
 ### Attention rule variant (CP-LRP)
