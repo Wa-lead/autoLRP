@@ -4,10 +4,14 @@
 
 # autoLRP
 
-A model-agnostic PyTorch implementation of Layer-wise Relevance Propagation.
+[![PyPI](https://img.shields.io/pypi/v/autolrp)](https://pypi.org/project/autoLRP/)
+[![Python](https://img.shields.io/pypi/pyversions/autolrp)](https://pypi.org/project/autoLRP/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+A model agnostic PyTorch implementation of Layer-wise Relevance Propagation.
 It works at the operation level, so it needs no module rewriting and no module
 names: wrap your input in `autoLRP.tensor()`, run the model as it is, pick an
-output scalar, and call `.lrp()`. It follows the philosophy of autograd — hence
+output scalar, and call `.lrp()`. It follows the philosophy of autograd, hence
 *autoLRP*.
 
 ```python
@@ -24,39 +28,67 @@ heatmap = x.relevance              # same shape as `image`
 pip install autolrp
 ```
 
+Links: [PyPI](https://pypi.org/project/autoLRP/) ·
+[Source](https://github.com/Wa-lead/autoLRP) ·
+[Issues](https://github.com/Wa-lead/autoLRP/issues)
+
 ## Examples
 
-Every figure below is produced by a notebook in [`examples/showcase`](examples/showcase);
-the input is wrapped, the model runs untouched, and `.lrp()` fills `.relevance`.
+Every figure below is produced by a notebook in
+[`examples/showcase`](examples/showcase). The input is wrapped, the model runs
+untouched, and `.lrp()` fills `.relevance`.
 
-**One image, two architectures.** Relevance on the pixels that drive the
-*tiger shark* class — a CNN and a vision transformer, same three lines of code.
+### Image classification (VGG-16, ViT-B/16)
+
+The same image through a CNN and a vision transformer: relevance on the pixels
+that drive the *tiger shark* class, from the same three lines of code.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/vgg16_shark.png" width="49%">
   <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/vit_shark.png" width="49%">
 </p>
 
-**Language.** Which tokens carry the prediction — a next-token completion in
-GPT-2 and a sentiment decision in BERT.
+### Next-token prediction (GPT-2)
+
+Which context tokens drive the next word.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/gpt2_france.png" width="70%">
-  <br><br>
+</p>
+
+### Sentiment (BERT)
+
+Which words carry the sentiment decision.
+
+<p align="center">
   <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/bert_positive.png" width="90%">
 </p>
 
-**BiLRP — explaining a similarity.** Beyond single predictions: decompose the
-dot-product similarity of two VGG-16 embeddings into the patch *pairs* that make
-the images look alike. Red pairs support the similarity, blue oppose it.
+### Image similarity (BiLRP)
+
+Beyond single predictions: decompose the dot-product similarity of two VGG-16
+embeddings into the patch *pairs* that make the images look alike. Red pairs
+support the similarity, blue pairs oppose it.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/bilrp_cats.png" width="80%">
 </p>
 
-**CP-LRP — one switch changes the attention rule.** `attn='cplrp'` treats the
+### Contrastive attribution (CLRP)
+
+Separating two classes present in one image. Plain LRP for *zebra* and
+*elephant* highlights both animals; CLRP subtracts the shared evidence so each
+target keeps only what is distinctive to it.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/showcase/clrp_zebra_elephant.png" width="90%">
+</p>
+
+### Attention rule variant (CP-LRP)
+
+One keyword changes how attention is propagated. `attn='cplrp'` treats the
 attention weights as constants (Ali et al. 2022) instead of propagating through
-them; the whole recipe change is one keyword.
+them.
 
 ```python
 out[0, pred].lrp(config=LRPConfig(attn='cplrp'))
@@ -73,26 +105,26 @@ pass already built:
 
 ```mermaid
 flowchart LR
-  A["autoLRP.tensor(x)"] --> B["forward pass<br/>(a few ops intercepted<br/>to save what rules need)"]
-  B --> C["walk<br/>graph → node plan"]
+  A["autoLRP.tensor(x)"] --> B["forward pass<br/>(ops intercepted to<br/>save what rules need)"]
+  B --> C["walk<br/>graph to node plan"]
   C --> D["analyze<br/>attach facts to nodes"]
   D --> E["install<br/>one LRP rule per node"]
   E --> F["backward<br/>relevance flows"]
   F --> G["x.relevance"]
 ```
 
-- **wrap** — `autoLRP.tensor(x)` marks the input; a handful of ops (`add`,
-  `sum`, `softmax`, fused attention, …) are replaced by versions that save the
-  activations the rules need. Gradients are the native ones, so the graph is
-  otherwise unchanged.
-- **walk** — after the forward pass, the autograd graph is traversed into an
-  ordered plan of nodes.
-- **analyze** — analyzers tag nodes with *facts* (for example, which operand of
-  an attention product is the softmax weights).
-- **install** — each node gets one hook that turns the incoming gradient into
-  relevance, chosen by the config from the node's name or its facts.
-- **backward** — one `backward` pass carries relevance to the wrapped input;
-  whatever arrives there is `x.relevance`.
+1. **wrap.** `autoLRP.tensor(x)` marks the input. A handful of ops (`add`,
+   `sum`, `softmax`, fused attention, and a few more) are replaced by versions
+   that save the activations the rules need. Gradients stay native, so the graph
+   is otherwise unchanged.
+2. **walk.** After the forward pass, the autograd graph is traversed into an
+   ordered plan of nodes.
+3. **analyze.** Analyzers tag nodes with *facts*, for example which operand of
+   an attention product is the softmax weights.
+4. **install.** Each node gets one hook that turns the incoming gradient into
+   relevance, chosen by the config from the node name or its facts.
+5. **backward.** One `backward` pass carries relevance to the wrapped input.
+   Whatever arrives there is `x.relevance`.
 
 ## Configuration
 
@@ -138,6 +170,20 @@ Rule tables, by family:
 | product  | `MulBackward`, `DivBackward`                         | `proportional`, `detach_lhs`, `detach_rhs`                          |
 | sum      | `AddBackward`, `SubBackward`                         | `proportional`, `equal`, `fixed`, `detach_lhs`, `detach_rhs`        |
 
+## Citing
+
+If you use autoLRP in your research, please cite it:
+
+```bibtex
+@software{alasad2026autolrp,
+  author  = {Alasad, Waleed},
+  title   = {autoLRP: Layer-wise Relevance Propagation on the PyTorch autograd graph},
+  year    = {2026},
+  version = {0.1.0},
+  url     = {https://github.com/Wa-lead/autoLRP}
+}
+```
+
 ## License
 
-MIT — see [LICENSE](LICENSE).
+autoLRP is released under the MIT License. See [LICENSE](LICENSE).

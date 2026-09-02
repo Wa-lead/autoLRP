@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use autoLRP in your research, please cite it as below."
+title: "autoLRP: Layer-wise Relevance Propagation on the PyTorch autograd graph"
+authors:
+  - family-names: Alasad
+    given-names: Waleed
+version: 0.1.0
+date-released: 2026-09-02
+license: MIT
+repository-code: "https://github.com/Wa-lead/autoLRP"
+url: "https://github.com/Wa-lead/autoLRP"
+keywords:
+  - layer-wise relevance propagation
+  - explainability
+  - interpretability
+  - attribution
+  - pytorch
