@@ -4,7 +4,7 @@ nothing, mean, sum and cumsum do not save the input. Each wrapper's
 backward equals the native gradient (bitwise, softmax within one
 ulp), and each node is named after the op it replaces
 (``AddBackward``), next to the native ``AddBackward0``. The wrappers
-run only when an :class:`autoLRP.LRPTensor` is in the call.
+run only when an :class:`autolrp.LRPTensor` is in the call.
 """
 import torch
 from torch._C import DisableTorchFunctionSubclass

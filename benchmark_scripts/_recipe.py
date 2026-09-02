@@ -6,7 +6,7 @@ recipe lives in exactly one place.
 
 Config vocabulary (current library): rule= is a dict keyed by exact canonical
 node names ('AddmmBackward') or analyzer fact names ('weights_operand');
-there are no aliases and no 'default' sentinel — start from autoLRP.BASE and
+there are no aliases and no 'default' sentinel — start from autolrp.BASE and
 override entries. A node no key addresses is a hard error.
 
 The text/EQA configuration:
@@ -67,7 +67,7 @@ def apply_bilinear(rule: dict, choice: str) -> None:
 def make_rule(*, gamma_linear=None, conv_gamma=None, bilinear: str = 'full') -> dict:
     r"""BASE with the benchmark's overrides applied. Returns a plain dict so
     callers can override further entries before building the LRPConfig."""
-    from autoLRP import BASE
+    from autolrp import BASE
     rule = dict(BASE)
     if gamma_linear is not None:
         rule['AddmmBackward'] = ('gamma', {'gamma': gamma_linear})
@@ -87,7 +87,7 @@ def build_config(gamma_linear: float, *, softmax: str = 'passthrough'):
     Returns:
         LRPConfig instance.
     """
-    from autoLRP import LRPConfig
+    from autolrp import LRPConfig
     return LRPConfig(
         rule=make_rule(gamma_linear=gamma_linear),
         softmax=softmax,
@@ -136,7 +136,7 @@ VIT_MM_GAMMA = 0.001
 def build_vgg_config(conv_gamma: float = VGG_CONV_GAMMA, *, relevance_filter: float = 1.0):
     r"""VGG config: gamma on convolutions (conv_gamma=125), epsilon on the
     classifier linears. No attention (CNN)."""
-    from autoLRP import LRPConfig
+    from autolrp import LRPConfig
     return LRPConfig(
         rule=make_rule(conv_gamma=conv_gamma),
         relevance_filter=relevance_filter,
@@ -150,7 +150,7 @@ def build_vit_config(conv_gamma: float = VIT_CONV_GAMMA, mm_gamma: float = VIT_M
     softmax='jacobian' (the fix): passthrough under-attributes the attention
     block (+0.3700 -> +0.4127 ABPC at n=100). The keyword overrides exist for
     the runner's --vit-softmax / --vit-bilinear ablation."""
-    from autoLRP import LRPConfig
+    from autolrp import LRPConfig
     return LRPConfig(
         rule=make_rule(gamma_linear=mm_gamma, conv_gamma=conv_gamma,
                        bilinear=bilinear),

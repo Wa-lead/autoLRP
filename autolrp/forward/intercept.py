@@ -1,4 +1,4 @@
-r"""``__torch_function__`` dispatch for :class:`autoLRP.LRPTensor`.
+r"""``__torch_function__`` dispatch for :class:`autolrp.LRPTensor`.
 
 ``REWRITES`` maps a torch function name to a rewrite
 ``fn(func, args, kwargs) -> result | NotImplemented``; PyTorch gives
@@ -6,7 +6,7 @@ every calling form one name (``a + b`` and ``torch.add`` both arrive
 as ``'add'``), and ``NotImplemented`` falls through to the native op.
 Built in: the fused-attention decomposition (toggle
 :func:`set_decompose_attention`), the state-saving wrappers of
-:mod:`autoLRP.forward.ops`, in-place to out-of-place remaps, and the
+:mod:`autolrp.forward.ops`, in-place to out-of-place remaps, and the
 live copy of weight operands (:data:`WEIGHT_BEARING`). Register your
 own with :func:`register_rewrite`; a registered name replaces the
 built-in. The attention and wrapper built-ins are module-level

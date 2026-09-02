@@ -8,10 +8,10 @@ import pytest
 import torch
 import torch.nn as nn
 
-import autoLRP as autolrp
+import autolrp
 from tests._cfg import on_linear
-from autoLRP import BASE
-from autoLRP import LRPConfig
+from autolrp import BASE
+from autolrp import LRPConfig
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +195,7 @@ def test_fused_sdpa_matches_decomposition(model_fn, seed, name, cfg):
 
 def test_fused_sdpa_installer_registered():
     """The fused-attention backend node names dispatch to install_sdpa."""
-    from autoLRP.backward.install import install_sdpa
+    from autolrp.backward.install import install_sdpa
     for nm in ("ScaledDotProductEfficientAttentionBackward0",
                "ScaledDotProductFlashAttentionForCpuBackward0"):
         _, fn = autolrp.match_installer(nm)

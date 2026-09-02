@@ -1,9 +1,9 @@
 r""":class:`LRPTensor`, the wrapped input. It captures the gradient that
 reaches it into ``.relevance`` and routes ops through
-:mod:`autoLRP.forward.intercept`. Choose the attributed scalar by
+:mod:`autolrp.forward.intercept`. Choose the attributed scalar by
 slicing the output::
 
-    x = autoLRP.tensor(image)
+    x = autolrp.tensor(image)
     out = model(x)
     out[0, k].lrp()                   # one class
     (out[0, a] - out[0, b]).lrp()     # class difference
@@ -52,7 +52,7 @@ class LRPTensor(torch.Tensor):
             config: Optional[LRPConfig] = None):
         r"""Run LRP from this scalar and fill ``.relevance`` on the wrapped
         inputs; one ``backward`` per call, the forward is not re-run.
-        ``config`` defaults to ``LRPConfig()`` (:data:`autoLRP.BASE`), or to
+        ``config`` defaults to ``LRPConfig()`` (:data:`autolrp.BASE`), or to
         ``LRPConfig(rule=rule)`` when only ``rule`` is given; passing both
         ``rule`` and ``config`` raises :class:`ValueError`. Returns ``self``,
         or the per-node dict when ``config.capture_layers`` is set.
@@ -72,7 +72,7 @@ class LRPTensor(torch.Tensor):
                     "scalar (e.g. out[0, k].lrp()).")
             raise RuntimeError(
                 "Cannot run LRP on a tensor with no computation graph. "
-                "Make sure you called autoLRP.tensor() on the input.")
+                "Make sure you called autolrp.tensor() on the input.")
 
         if config is None:
             config = LRPConfig() if rule is None else LRPConfig(rule=rule)

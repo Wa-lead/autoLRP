@@ -1,6 +1,6 @@
 r"""Graph walker and hook runner: :func:`walk` lists the nodes and their
 installers, :func:`execute` installs the hooks and runs ``backward``,
-:func:`graph_lrp` does both for :meth:`autoLRP.LRPTensor.lrp`. The
+:func:`graph_lrp` does both for :meth:`autolrp.LRPTensor.lrp`. The
 attributed scalar is chosen by slicing the output first
 (``out[0, k].lrp()``).
 """
@@ -90,7 +90,7 @@ def walk(output: torch.Tensor,
             warnings.warn(
                 f"autoLRP: no installer matched {name!r}; the native "
                 f"gradient runs there. Register one via "
-                f"autoLRP.register_installer.", UserWarning, stacklevel=3)
+                f"autolrp.register_installer.", UserWarning, stacklevel=3)
     return plan
 
 
@@ -289,7 +289,7 @@ def graph_lrp(output: torch.Tensor,
         raise RuntimeError(
             "autoLRP: the autograd graph under this output contains no "
             "wrapped-input leaf -- the gradient road from the output back "
-            "to an autoLRP.tensor(...) input was severed "
+            "to an autolrp.tensor(...) input was severed "
             "(torch.no_grad() inside the forward, a .detach() or "
             ".detach().requires_grad_(True) re-attachment, or a numpy "
             "round-trip). Relevance cannot reach the wrapped input.")

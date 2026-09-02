@@ -7,9 +7,9 @@ import pytest
 import torch
 import torch.nn as nn
 
-import autoLRP as autolrp
-from autoLRP import LRPConfig, BASE, register_analyzer, ANALYZERS
-from autoLRP.backward.rules import FAMILIES
+import autolrp
+from autolrp import LRPConfig, BASE, register_analyzer, ANALYZERS
+from autolrp.backward.rules import FAMILIES
 from tests._cfg import on_linear
 
 
@@ -29,7 +29,7 @@ class TestBase:
 
 class TestKeys:
     def test_bare_string_is_rejected(self):
-        with pytest.raises(TypeError, match="start from autoLRP.BASE"):
+        with pytest.raises(TypeError, match="start from autolrp.BASE"):
             LRPConfig(rule='epsilon')
 
     def test_bare_tuple_is_rejected(self):
@@ -186,7 +186,7 @@ class TestPerOpDispatch:
         torch.manual_seed(0)
         model = nn.Sequential(nn.Linear(8, 4, bias=False)).eval()
         x_data = torch.randn(1, 8)
-        from autoLRP.backward import rules as _rules
+        from autolrp.backward import rules as _rules
         _rules._GAMMA_DEGENERATION_WARNED.clear()
         x1 = autolrp.tensor(x_data.clone())
         with pytest.warns(UserWarning, match="runs the epsilon rule instead"):

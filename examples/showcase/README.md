@@ -37,6 +37,6 @@ package is not installed.
 | `paper_impl/01_bilrp_vgg16` | BiLRP with the paper's depth-dependent gammas written as analyzers |
 | `paper_impl/02_bilrp_bert` | BiLRP on sentence pairs |
 | `paper_impl/03_clrp_vgg16` | contrastive LRP, the paper's figure |
-| `paper_impl/04_evaluation_metrics` | the four faithfulness metrics in `autoLRP.eval` |
+| `paper_impl/04_evaluation_metrics` | the four faithfulness metrics in `autolrp.eval` |
 
 `test_viz.py` exercises the plotting helpers with random data.

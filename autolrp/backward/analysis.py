@@ -1,8 +1,8 @@
 r"""Graph analysis: facts about autograd nodes.
 
 An analyzer is ``fn(nodes) -> {node: fact}`` over the whole plan, run
-between :func:`~autoLRP.backward.engine.walk` and
-:func:`~autoLRP.backward.engine.execute`. It reads the graph and the
+between :func:`~autolrp.backward.engine.walk` and
+:func:`~autolrp.backward.engine.execute`. It reads the graph and the
 saved tensors, never module names, and writes ``node.metadata['lrp']``.
 It writes only the fact it is registered as, so a config key can be
 checked against :data:`ANALYZERS` at construction; the value may carry
@@ -89,7 +89,7 @@ def node_facts(node) -> dict:
 
 def is_weight_leaf(var) -> bool:
     """A leaf that carries no relevance of its own. Relevance flows to
-    what the user wrapped with :func:`autoLRP.tensor`; every other leaf,
+    what the user wrapped with :func:`autolrp.tensor`; every other leaf,
     an ``nn.Parameter``, a constant the forward intercept made live, a
     plain tensor with ``requires_grad``, is a weight."""
     return not getattr(var, '_lrp_init', False)

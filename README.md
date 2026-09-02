@@ -10,15 +10,15 @@
 
 A model agnostic PyTorch implementation of Layer-wise Relevance Propagation.
 It works at the operation level, so it needs no module rewriting and no module
-names: wrap your input in `autoLRP.tensor()`, run the model as it is, pick an
+names: wrap your input in `autolrp.tensor()`, run the model as it is, pick an
 output scalar, and call `.lrp()`. It follows the philosophy of autograd, hence
 *autoLRP*.
 
 ```python
-import autoLRP
-from autoLRP import LRPConfig, BASE
+import autolrp
+from autolrp import LRPConfig, BASE
 
-x = autoLRP.tensor(image)          # the input you want relevance for
+x = autolrp.tensor(image)          # the input you want relevance for
 out = model(x)                     # run the model unchanged
 out[0, pred].lrp()                 # relevance of class `pred`
 heatmap = x.relevance              # same shape as `image`
@@ -120,7 +120,7 @@ pass already built:
   <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/pipeline.png?v=3" width="100%">
 </p>
 
-1. **wrap.** `autoLRP.tensor(x)` marks the input. A handful of ops (`add`,
+1. **wrap.** `autolrp.tensor(x)` marks the input. A handful of ops (`add`,
    `sum`, `softmax`, fused attention, and a few more) are replaced by versions
    that save the activations the rules need. Gradients stay native, so the graph
    is otherwise unchanged.

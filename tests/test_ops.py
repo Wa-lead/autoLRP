@@ -17,10 +17,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import autoLRP as autolrp
+import autolrp
 from tests._cfg import on_linear
-from autoLRP import BASE
-from autoLRP import LRPConfig
+from autolrp import BASE
+from autolrp import LRPConfig
 
 
 # ---------------------------------------------------------------------------
@@ -174,14 +174,14 @@ def test_softmax_mode_produces_finite_R(mode):
 
 class TestWrapperBackwardParity:
     def test_softmax(self):
-        from autoLRP.forward.ops import Softmax as _LRPSoftmax
+        from autolrp.forward.ops import Softmax as _LRPSoftmax
         x = torch.randn(2, 8, requires_grad=True)
         g_native, = _grad(lambda t: torch.softmax(t, dim=-1), x)
         g_wrap, = _grad(lambda t: _LRPSoftmax.apply(t, -1), x)
         torch.testing.assert_close(g_native, g_wrap, atol=1e-6, rtol=0)
 
     def test_add(self):
-        from autoLRP.forward.ops import Add as _LRPAdd
+        from autolrp.forward.ops import Add as _LRPAdd
         a = torch.randn(2, 8, requires_grad=True)
         b = torch.randn(2, 8, requires_grad=True)
         ga_n, gb_n = _grad(lambda x, y: x + y, a, b)
@@ -190,7 +190,7 @@ class TestWrapperBackwardParity:
         torch.testing.assert_close(gb_n, gb_w, atol=1e-6, rtol=0)
 
     def test_sub(self):
-        from autoLRP.forward.ops import Sub as _LRPSub
+        from autolrp.forward.ops import Sub as _LRPSub
         a = torch.randn(2, 8, requires_grad=True)
         b = torch.randn(2, 8, requires_grad=True)
         ga_n, gb_n = _grad(lambda x, y: x - y, a, b)
@@ -202,7 +202,7 @@ class TestWrapperBackwardParity:
         (None, False), (-1, False), (-1, True), ((1, 2), False),
     ])
     def test_mean(self, dim, keepdim):
-        from autoLRP.forward.ops import Mean as _LRPMean
+        from autolrp.forward.ops import Mean as _LRPMean
         x = torch.randn(2, 4, 8, requires_grad=True)
         native = (lambda t: t.mean()) if dim is None else (
             lambda t: t.mean(dim=dim, keepdim=keepdim))
@@ -211,7 +211,7 @@ class TestWrapperBackwardParity:
         torch.testing.assert_close(g_n, g_w, atol=1e-6, rtol=0)
 
     def test_sum(self):
-        from autoLRP.forward.ops import Sum as _LRPSum
+        from autolrp.forward.ops import Sum as _LRPSum
         x = torch.randn(2, 4, 8, requires_grad=True)
         g_n, = _grad(lambda t: t.sum(dim=-1), x)
         g_w, = _grad(lambda t: _LRPSum.apply(t, -1, False), x)

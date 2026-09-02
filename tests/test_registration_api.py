@@ -1,6 +1,6 @@
 """Registration idioms are uniform across all three registries."""
 import torch
-import autoLRP as A
+import autolrp as A
 
 
 def _dummy(node, config):

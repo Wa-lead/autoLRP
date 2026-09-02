@@ -106,7 +106,7 @@ def _trace(key, what):
 def resolve_rule(mapping, node, registry):
     r"""The rule function and keyword arguments for ``node`` from the
     config's ``rule`` dict, looked up in ``registry`` (the family's table).
-    The entry is picked by :func:`~autoLRP.backward.resolve.match`; a
+    The entry is picked by :func:`~autolrp.backward.resolve.match`; a
     ``'detach'`` entry becomes ``detach_lhs``/``detach_rhs`` from the slot
     fact named by its ``by=``, or the family's fallback when the node has
     no such fact. A name the family cannot run is an error.
@@ -739,7 +739,7 @@ def _fused_product(config, node, live_left, live_right, weights_on_left):
 
 def install_sdpa(node, config):
     r"""Fused scaled-dot-product attention node, used when
-    :func:`autoLRP.set_decompose_attention` is off. Reconstructs the
+    :func:`autolrp.set_decompose_attention` is off. Reconstructs the
     attention matrix from the saved query, key, value and logsumexp, then
     runs the same rules the decomposed graph would: each of the two
     products resolved by which operands come from the input
@@ -755,7 +755,7 @@ def install_sdpa(node, config):
     if lse is None:
         lse = getattr(node, '_saved_log_sumexp', None)
     if q is None or k is None or v is None or lse is None:
-        _warn_missing_state(node, 'this SDPA backend did not save query/key/value/logsumexp; use autoLRP.set_decompose_attention(True) for full rule coverage')
+        _warn_missing_state(node, 'this SDPA backend did not save query/key/value/logsumexp; use autolrp.set_decompose_attention(True) for full rule coverage')
         return
     mask = getattr(node, '_saved_attn_mask', None)
     if mask is None:

@@ -84,7 +84,7 @@ def _check_key(field_name: str, key, node_names) -> str:
             f"{canonical(key)!r}")
     hint = ''
     if key == 'default':
-        hint = " There is no 'default': start from autoLRP.BASE and override entries."
+        hint = " There is no 'default': start from autolrp.BASE and override entries."
     raise ValueError(
         f"unknown {field_name} key {key!r}: not a node name "
         f"{sorted(node_names)} and not a fact {sorted(ANALYZERS)}.{hint}")
@@ -174,7 +174,7 @@ class LRPConfig:
         if not isinstance(self.rule, dict):
             raise TypeError(
                 "rule must be a dict keyed by node name or fact name; start "
-                "from autoLRP.BASE, e.g. rule={**BASE, 'BmmBackward': 'uniform'}")
+                "from autolrp.BASE, e.g. rule={**BASE, 'BmmBackward': 'uniform'}")
         rule = dict(self.rule)
 
         if self.attn is not None:

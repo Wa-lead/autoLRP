@@ -34,12 +34,12 @@ try:
 except ImportError:                                    # numpy is optional here
     _np = None
 
-from autoLRP.backward import strategies as _strategies
-from autoLRP.backward import analysis as _analysis
-from autoLRP.backward import install as _install
-from autoLRP.backward import rules as _rules
-from autoLRP.backward import engine as _engine
-from autoLRP.forward import intercept as _intercept
+from autolrp.backward import strategies as _strategies
+from autolrp.backward import analysis as _analysis
+from autolrp.backward import install as _install
+from autolrp.backward import rules as _rules
+from autolrp.backward import engine as _engine
+from autolrp.forward import intercept as _intercept
 
 
 @pytest.fixture(autouse=True)

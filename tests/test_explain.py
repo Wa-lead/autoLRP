@@ -4,8 +4,8 @@ import warnings
 import torch
 import torch.nn as nn
 
-import autoLRP as autolrp
-from autoLRP import LRPConfig, BASE, explain, explain_summary, register_analyzer, ANALYZERS
+import autolrp
+from autolrp import LRPConfig, BASE, explain, explain_summary, register_analyzer, ANALYZERS
 
 
 def _layer():

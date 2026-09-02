@@ -8,10 +8,10 @@ import pytest
 import torch
 import torch.nn as nn
 
-import autoLRP as autolrp
+import autolrp
 from tests._cfg import on_linear
-from autoLRP import BASE
-from autoLRP import LRPConfig
+from autolrp import BASE
+from autolrp import LRPConfig
 
 
 # ---------------------------------------------------------------------------

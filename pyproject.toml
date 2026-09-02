@@ -38,4 +38,4 @@ test = ["pytest", "pytest-randomly"]
 parity = ["zennit"]
 
 [tool.setuptools.packages.find]
-include = ["autoLRP*"]
+include = ["autolrp*"]

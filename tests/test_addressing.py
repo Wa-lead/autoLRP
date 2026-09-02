@@ -17,12 +17,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import autoLRP as autolrp
-from autoLRP import LRPConfig, BASE, set_decompose_attention, node_facts, walk
-from autoLRP.backward import analysis
-from autoLRP.backward.install import resolve_rule, _AsBmm, _Named
-from autoLRP.backward.rules import FAMILIES, BMM_RULES, LINEAR_RULES, MUL_RULES
-from autoLRP.backward.strategies import build_strategy
+import autolrp
+from autolrp import LRPConfig, BASE, set_decompose_attention, node_facts, walk
+from autolrp.backward import analysis
+from autolrp.backward.install import resolve_rule, _AsBmm, _Named
+from autolrp.backward.rules import FAMILIES, BMM_RULES, LINEAR_RULES, MUL_RULES
+from autolrp.backward.strategies import build_strategy
 
 
 def _bmm_attn_model(transposed):
@@ -198,7 +198,7 @@ class TestResolveRule:
             resolve_rule({'AddBackward': 'equal'}, node, MUL_RULES)
 
     def test_two_fact_entries_on_one_node_is_an_error(self):
-        from autoLRP import register_analyzer, ANALYZERS
+        from autolrp import register_analyzer, ANALYZERS
         register_analyzer('also_weights')(
             lambda nodes: {n: 'also_weights' for n in nodes if 'BmmBackward' in n.name()})
         try:
@@ -211,7 +211,7 @@ class TestResolveRule:
             ANALYZERS.pop('also_weights')
 
     def test_an_analyzer_writes_only_its_own_fact(self):
-        from autoLRP import register_analyzer, ANALYZERS
+        from autolrp import register_analyzer, ANALYZERS
         register_analyzer('one_name')(
             lambda nodes: {n: {'other_name': 1} for n in nodes if 'MulBackward' in n.name()})
         try:

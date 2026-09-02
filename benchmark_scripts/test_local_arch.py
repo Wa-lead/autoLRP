@@ -42,7 +42,7 @@ def tiny_bert_qa():
 
 
 def autolrp_cfg(gamma):
-    from autoLRP import LRPConfig
+    from autolrp import LRPConfig
     from _recipe import make_rule
     return LRPConfig(rule=make_rule(gamma_linear=gamma),
                      softmax='passthrough', layernorm='passthrough',
@@ -117,11 +117,11 @@ def main():
     mv = ViTForImageClassification(vcfg_m).eval()
     for p in mv.parameters(): p.requires_grad_(True)
     img = torch.randn(1,3,32,32)
-    from autoLRP import LRPConfig
+    from autolrp import LRPConfig
     from _recipe import make_rule
     vcfg = LRPConfig(rule=make_rule(gamma_linear=0.001, conv_gamma=125.0),
                      softmax='passthrough', layernorm='passthrough', activation='passthrough')
-    import autoLRP as autolrp
+    import autolrp
     xv = autolrp.tensor(img); ov = mv(xv).logits; pv=int(ov.argmax(-1)); ov[0,pv].lrp(config=vcfg)
     relmap = xv.relevance.detach()
     results['autolrp_vision'] = (relmap is not None and tuple(relmap.shape)==(1,3,32,32)

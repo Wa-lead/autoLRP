@@ -15,10 +15,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import autoLRP as autolrp
+import autolrp
 from tests._cfg import on_linear
-from autoLRP import BASE
-from autoLRP import LRPConfig
+from autolrp import BASE
+from autolrp import LRPConfig
 
 zennit = pytest.importorskip(
     'zennit', reason='zennit required for parity tests')

@@ -15,10 +15,10 @@ import pytest
 import torch
 import torch.nn as nn
 
-import autoLRP as autolrp
-from autoLRP import LRPConfig, EXPLICIT_STRATEGY, INSTALLERS, merge, register_installer, installer
-from autoLRP.backward.strategies import match_installer, is_shape_node
-from autoLRP.backward.install import install_passthrough, install_noop
+import autolrp
+from autolrp import LRPConfig, EXPLICIT_STRATEGY, INSTALLERS, merge, register_installer, installer
+from autolrp.backward.strategies import match_installer, is_shape_node
+from autolrp.backward.install import install_passthrough, install_noop
 
 
 # ---------------------------------------------------------------------------

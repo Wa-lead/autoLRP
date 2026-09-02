@@ -1,7 +1,7 @@
 r"""Strategy table: ``{pattern: installer}`` matched by longest substring
 of ``grad_fn.name()``, so ``'LeakyReluBackward'`` beats
 ``'ReluBackward'`` whatever the order. This is the internal table;
-user config keys are matched exactly (:mod:`autoLRP.backward.resolve`).
+user config keys are matched exactly (:mod:`autolrp.backward.resolve`).
 ``None`` or a missing key means the native gradient runs. Extend with
 :func:`register_installer` or :func:`merge`.
 """

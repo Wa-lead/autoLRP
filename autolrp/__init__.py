@@ -2,10 +2,10 @@ r"""autoLRP: layer-wise relevance propagation on the autograd graph.
 
 Wrap the input, run the model, pick the output scalar, call ``.lrp()``::
 
-    import autoLRP
-    from autoLRP import LRPConfig, BASE
+    import autolrp
+    from autolrp import LRPConfig, BASE
 
-    x = autoLRP.tensor(image)
+    x = autolrp.tensor(image)
     out = model(x)
     out[0, pred].lrp()                     # BASE: epsilon on linear
     heatmap = x.relevance                  # families, proportional elsewhere

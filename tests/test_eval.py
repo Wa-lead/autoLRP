@@ -1,4 +1,4 @@
-"""Tests for autoLRP.eval — the attribution-evaluation suite.
+"""Tests for autolrp.eval — the attribution-evaluation suite.
 
 The headline property we test: each metric distinguishes a *good*
 attribution (LRP / gradient×input on the trained model) from a *bad*
@@ -10,8 +10,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-import autoLRP as autolrp
-from autoLRP import LRPConfig, eval as alrp_eval
+import autolrp
+from autolrp import LRPConfig, eval as alrp_eval
 
 
 # ---------------------------------------------------------------------------

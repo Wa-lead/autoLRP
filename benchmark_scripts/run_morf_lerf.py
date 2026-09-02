@@ -56,7 +56,7 @@ def build_attribute(method, task, model, tok, emb, kind, args, device):
     r"""Return a closure attribute(input_ids, target) -> relevance for this method."""
     if method == "autolrp":
         _find_autolrp(args.autolrp_repo)
-        from autoLRP import LRPConfig
+        from autolrp import LRPConfig
         from _recipe import make_rule
         # Build the text (LLaMA) config from CLI knobs. Defaults are the faithful
         # config: gamma=1.0 linears + softmax=jacobian (the imdb/wiki fix) +
@@ -275,7 +275,7 @@ def main():
             pred = int(get_logits(model(img)).argmax(-1))
         try:
             if args.method == "autolrp":
-                import autoLRP as autolrp
+                import autolrp
                 x = autolrp.tensor(img)
                 o = get_logits(model(x))
                 o[0, pred].lrp(config=vcfg)

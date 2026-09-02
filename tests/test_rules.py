@@ -17,12 +17,12 @@ import torch.nn as nn
 
 import torch as _torch
 
-from autoLRP.backward.lrp_utils import (
+from autolrp.backward.lrp_utils import (
     run_linear_rule, reduction_share, stabilize, mm_ops,
 )
 from tests._cfg import on_linear
-from autoLRP import BASE
-from autoLRP.backward.rules import (
+from autolrp import BASE
+from autolrp.backward.rules import (
     epsilon, zplus, alpha_beta, gamma, zbox, BMM_RULES,
 )
 
@@ -201,7 +201,7 @@ class TestGamma:
         fwd, bwd_a, bwd_b = mm_ops()
         R_eps = compute_linear_family_r_in(
             x, w, None, R_out, epsilon, {}, fwd, bwd_a, bwd_b, eps=1e-11)
-        from autoLRP.backward import rules as _rules
+        from autolrp.backward import rules as _rules
         _rules._GAMMA_DEGENERATION_WARNED.clear()
         with pytest.warns(UserWarning, match="runs the epsilon rule instead"):
             R_gamma_tiny = compute_linear_family_r_in(
@@ -374,10 +374,10 @@ class TestSignStructure:
 # through the ONE resolver the installers use (_resolve_family_rule).
 # ---------------------------------------------------------------------------
 
-import autoLRP as autolrp
-from autoLRP import LRPConfig
-from autoLRP.backward.rules import LINEAR_RULES, BMM_RULES
-from autoLRP.backward.install import resolve_rule
+import autolrp
+from autolrp import LRPConfig
+from autolrp.backward.rules import LINEAR_RULES, BMM_RULES
+from autolrp.backward.install import resolve_rule
 
 
 def _dispatch(cfg, node, registry=LINEAR_RULES, default='epsilon'):
@@ -428,7 +428,7 @@ class TestGammaDegenerationWarning:
 
     def test_warns_at_tiny_gamma(self):
         import warnings as _w
-        from autoLRP.backward import rules as _rules
+        from autolrp.backward import rules as _rules
         _rules._GAMMA_DEGENERATION_WARNED.clear()
         x = torch.randn(2, 4).clamp(min=0)
         w = torch.randn(4, 3)
@@ -464,7 +464,7 @@ class TestInputConvFact:
     ZB = ('zbox', {'low': -1.0, 'high': 1.0})
 
     def _facts_plan(self, cfg):
-        from autoLRP.backward import analysis as A
+        from autolrp.backward import analysis as A
         model = _two_conv_cnn()
         x = autolrp.tensor(torch.randn(1, 3, 8, 8))
         plan = autolrp.walk(model(x)[0, 0],
@@ -473,7 +473,7 @@ class TestInputConvFact:
         return plan
 
     def test_zbox_only_at_input_conv(self):
-        from autoLRP.backward.analysis import node_facts
+        from autolrp.backward.analysis import node_facts
         cfg = LRPConfig(rule={**BASE, 'input_conv': self.ZB})
         plan = self._facts_plan(cfg)
         input_fn, interior = None, []
@@ -493,7 +493,7 @@ class TestInputConvFact:
         the other convs. The input conv matches BOTH 'input_conv' (fact)
         and 'ConvolutionBackward' (name); the fact tier must win —
         structural facts are more specific than any name substring."""
-        from autoLRP.backward.analysis import node_facts
+        from autolrp.backward.analysis import node_facts
         cfg = LRPConfig(rule={**BASE, 'input_conv': self.ZB,
                               'ConvolutionBackward': 'zplus'})
         plan = self._facts_plan(cfg)

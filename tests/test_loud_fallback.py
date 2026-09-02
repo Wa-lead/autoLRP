@@ -4,11 +4,11 @@ import warnings
 import torch
 import torch.nn as nn
 
-import autoLRP as A
+import autolrp as A
 from tests._cfg import on_linear
-from autoLRP import BASE
-from autoLRP import LRPConfig
-from autoLRP.backward import install as INST
+from autolrp import BASE
+from autolrp import LRPConfig
+from autolrp.backward import install as INST
 
 
 class TestFrozenParamTrap:

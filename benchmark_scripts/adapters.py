@@ -28,7 +28,7 @@ def attribute_autolrp(model, input_ids, target, *, embed_layer, config,
     output_kind: 'logits' (seq-cls / causal LM) or 'span' (EQA start+end).
     For 'span', `target` must be (start_idx, end_idx).
     """
-    import autoLRP as autolrp
+    import autolrp
     device = device or next(model.parameters()).device
     x = autolrp.tensor(embed_layer(input_ids).detach())
     fwd = {"inputs_embeds": x}
