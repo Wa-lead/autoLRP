@@ -4,6 +4,7 @@ replaces the node's gradient inputs by relevance shares. It returns
 the hook handle, or ``None`` when the native gradient is the right
 routing (shape ops, selections) or the node saved nothing.
 """
+
 import torch
 import torch.nn.functional as F
 
@@ -13,13 +14,14 @@ from .lrp_utils import (
     stabilize,
     conv_ops,
     conv_transposed_ops,
-    reduction_share,
     apply_bias_split,
 )
-from .rules import LINEAR_RULES, MUL_RULES, BMM_RULES, ADD_RULES
-from .analysis import node_facts, parents, reaches_input
-from .resolve import resolve, match, _normalize
-from ..utils import find_bias
+from .rules import (LINEAR_RULES, MUL_RULES, BMM_RULES, ADD_RULES,
+                    SOFTMAX_RULES, LAYERNORM_RULES, ACTIVATION_RULES,
+                    REDUCTION_RULES)
+from .rules import passthrough as _rules_passthrough
+from .graph import node_facts, parents, reaches_input, find_bias, live_slots, input_slots
+from .resolve import resolve, resolve_rule, _trace
 
 
 _MISSING_LINEAR_STATE = (
@@ -95,65 +97,55 @@ def as_grad_tuple(gi, slot_shares):
             out[sl] = _reduce_to(share, gi[sl])
     return _match_dtype(tuple(out), gi)
 
-_TRACE = None                     # list of (key, what) while explain() runs
+def install_norm(node, config):
+    r"""``x.norm()`` / ``linalg.vector_norm``: a reduction whose native
+    gradient is ``x / ||x||``, a scaling. Share the output relevance
+    over the reduced elements in proportion to ``|x|``, the same policy
+    as our mean and sum."""
+    x = getattr(node, '_saved_self', None)
+    if x is None:
+        _warn_missing_state(
+            node, 'its saved input is unavailable -- the usual cause is '
+            'parameters with requires_grad=False; call p.requires_grad_(True) '
+            'on the model parameters')
+        return
+    dim = getattr(node, '_saved_dim', None)
+    keepdim = bool(getattr(node, '_saved_keepdim', False))
+    if isinstance(dim, int):
+        dim = (dim,)
+    elif dim is not None:
+        dim = tuple(dim)
+        if len(dim) == 0:
+            dim = None
+    eps = config.eps
+    rule = REDUCTION_RULES[REDUCTION_RULES.default]
+    _trace(None, rule.__name__)
+
+    def _hook(gi, go, _x=x, _dim=dim, _keep=keepdim, _eps=eps, _rule=rule):
+        R_in = _rule(_x, None, go[0], _eps, dim=_dim, keepdim=_keep)
+        return as_grad_tuple(gi, {0: R_in})
+    return node.register_hook(_hook)
 
 
-def _trace(key, what):
-    if _TRACE is not None:
-        _TRACE.append((key, what))
+def install_cumsum(node, config):
+    r"""``cumsum``: a linear map with 0/1 weights, ``y_j = sum_{i<=j} x_i``.
+    The epsilon rule gives ``R_i = x_i * sum_{j>=i} R_j / y_j``, a reversed
+    cumulative sum of ``R / y``; the native gradient would hand every
+    ``x_i`` the full ``R_j`` of each later output."""
+    saved = getattr(node, 'saved_tensors', None)      # our Cumsum wrapper
+    if not saved or not hasattr(node, 'dim'):
+        return                                         # native: nothing to read
+    x, dim = saved[0], node.dim
+    eps = config.eps
+    _trace(None, 'epsilon (cumsum)')
 
-
-def resolve_rule(mapping, node, registry):
-    r"""The rule function and keyword arguments for ``node`` from the
-    config's ``rule`` dict, looked up in ``registry`` (the family's table).
-    The entry is picked by :func:`~autolrp.backward.resolve.match`; a
-    ``'detach'`` entry becomes ``detach_lhs``/``detach_rhs`` from the slot
-    fact named by its ``by=``, or the family's fallback when the node has
-    no such fact. A name the family cannot run is an error.
-    """
-    key = match(mapping, node)
-    spec = mapping[key]
-    name, kw = _normalize(spec)
-    if name == 'detach':
-        name, kw = _detach_side(kw, node, registry)
-    if callable(name):
-        fn = name
-    elif name not in registry:
-        raise ValueError(
-            f"entry {key!r}={spec!r} addresses {node.name()}, whose family "
-            f"cannot run {name!r}. Valid here: {sorted(registry)} and "
-            f"'detach'")
-    else:
-        fn = registry[name]
-    _trace(key, getattr(fn, '__name__', repr(fn)))
-    return fn, kw
-
-
-def _detach_side(kw, node, registry):
-    kw = dict(kw)                     # never mutate the config's entry
-    by = kw.pop('by', None)
-    if not isinstance(by, str) or not by:
-        raise ValueError(
-            "'detach' needs by=<fact name>, e.g. "
-            "('detach', {'by': 'weights_operand'}); 'detach_lhs' / "
-            "'detach_rhs' name a side directly")
-    facts = node_facts(node)
-    if by not in facts:
-        return registry.default, {}   # no referent: the family fallback
-    slot = facts[by]
-    if isinstance(slot, bool) or slot not in (0, 1):
-        raise ValueError(
-            f"'detach' by={by!r}: on {node.name()} that fact is {slot!r}, "
-            f"not a side (0 for the left operand, 1 for the right)")
-    return ('detach_lhs' if slot == 0 else 'detach_rhs'), kw
-
-
-def _live_slots(node):
-    r"""Operand slots of a two-operand node that relevance can flow to.
-    A constant operand (a Python number, a tensor without grad) has no
-    parent node, so ``next_functions`` holds ``None`` there."""
-    ps = parents(node, skip_aliases=False)
-    return [i for i in (0, 1) if i < len(ps) and ps[i] is not None]
+    def _hook(gi, go, _x=x, _dim=dim, _eps=eps):
+        with torch.no_grad():
+            y = torch.cumsum(_x, _dim)
+            s = go[0] / stabilize(y, _eps)
+            R_in = _x * torch.flip(torch.cumsum(torch.flip(s, (_dim,)), _dim), (_dim,))
+        return as_grad_tuple(gi, {0: R_in})
+    return node.register_hook(_hook)
 
 
 def _install_single_operand(node, slot):
@@ -189,12 +181,6 @@ class _Named:
 
 # ---- linear family (addmm / mm / conv / bmm) -------------------------
 
-def _input_slots(node, slots):
-    r"""Which of ``slots`` hold an operand that reaches the wrapped input."""
-    ps = parents(node, skip_aliases=False)
-    return [i for i in slots if i < len(ps) and reaches_input(ps[i])]
-
-
 def _install_product(node, config, a, b, slot_a, slot_b, bias=None):
     r"""Common installer for ``z = a @ b (+ bias)``: addmm, mm, bmm. Which
     operands reach the wrapped input decides the family. One: a linear
@@ -203,7 +189,7 @@ def _install_product(node, config, a, b, slot_a, slot_b, bias=None):
     a ``Bmm`` node as ``MmBackward``. Both: bilinear, addressed as
     ``BmmBackward``, ``BMM_RULES``. Neither: nothing installs.
     """
-    live = _input_slots(node, (slot_a, slot_b))
+    live = input_slots(node, (slot_a, slot_b))
     if not live:
         return
     eps = config.eps
@@ -257,7 +243,7 @@ def install_addmm(node, config):
         _warn_missing_state(node, _MISSING_LINEAR_STATE)
         return
     return _install_product(node, config, a, b, 1, 2,
-                            bias=find_bias(node, parent_idx=0))
+                            bias=find_bias(node, slot=0))
 
 
 def install_mm(node, config):
@@ -288,7 +274,7 @@ def install_conv(node, config):
     groups = getattr(node, '_saved_groups', 1)
     ndim = x.ndim - 2
 
-    bias = find_bias(node, parent_idx=2)
+    bias = find_bias(node, slot=2)
     if bias is not None:
         bias = bias.view([1, -1] + [1] * ndim)
 
@@ -334,7 +320,7 @@ def install_mul(node, config):
     ``'MulBackward'``) picks from ``MUL_RULES``. The statistic transparency
     of norms comes from the ``statistic_operand`` entry of ``BASE``.
     """
-    live = _live_slots(node)
+    live = live_slots(node)
     if len(live) == 1:
         return _install_single_operand(node, live[0])
     a = getattr(node, '_saved_self', None)
@@ -361,7 +347,7 @@ def install_div(node, config):
     second operand enters as its stabilized reciprocal so the split
     matches ``a * (1/b)``.
     """
-    live = _live_slots(node)
+    live = live_slots(node)
     if len(live) == 1:
         return _install_single_operand(node, live[0])
     a = getattr(node, '_saved_self', None)
@@ -415,57 +401,6 @@ def install_add(node, config):
 
 # ---- reductions (norm / cumsum / mean / sum) -------------------------
 
-def install_norm(node, config):
-    r"""``x.norm()`` / ``linalg.vector_norm``: a reduction whose native
-    gradient is ``x / ||x||``, a scaling. Share the output relevance
-    over the reduced elements in proportion to ``|x|``, the same policy
-    as our mean and sum. Warns and keeps the native gradient when the
-    node did not save its input."""
-    x = getattr(node, '_saved_self', None)
-    if x is None:
-        _warn_missing_state(
-            node, 'its saved input is unavailable -- the usual cause is '
-            'parameters with requires_grad=False; call p.requires_grad_(True) '
-            'on the model parameters')
-        return
-    dim = getattr(node, '_saved_dim', None)
-    keepdim = bool(getattr(node, '_saved_keepdim', False))
-    if isinstance(dim, int):
-        dim = (dim,)
-    elif dim is not None:
-        dim = tuple(dim)
-        if len(dim) == 0:
-            dim = None
-    eps = config.eps
-    _trace(None, 'reduction_share')
-
-    def _hook(gi, go, _x=x, _dim=dim, _keep=keepdim, _eps=eps):
-        R_in = reduction_share(_x, go[0], _dim, _keep, _eps)
-        return as_grad_tuple(gi, {0: R_in})
-    return node.register_hook(_hook)
-
-
-def install_cumsum(node, config):
-    r"""``cumsum``: a linear map with 0/1 weights, ``y_j = sum_{i<=j} x_i``.
-    The epsilon rule gives ``R_i = x_i * sum_{j>=i} R_j / y_j``, a reversed
-    cumulative sum of ``R / y``; the native gradient would hand every
-    ``x_i`` the full ``R_j`` of each later output."""
-    saved = getattr(node, 'saved_tensors', None)      # our Cumsum wrapper
-    if not saved or not hasattr(node, 'dim'):
-        return                                         # native: nothing to read
-    x, dim = saved[0], node.dim
-    eps = config.eps
-    _trace(None, 'epsilon (cumsum)')
-
-    def _hook(gi, go, _x=x, _dim=dim, _eps=eps):
-        with torch.no_grad():
-            y = torch.cumsum(_x, _dim)
-            s = go[0] / stabilize(y, _eps)
-            R_in = _x * torch.flip(torch.cumsum(torch.flip(s, (_dim,)), _dim), (_dim,))
-        return as_grad_tuple(gi, {0: R_in})
-    return node.register_hook(_hook)
-
-
 def install_mean_or_sum(node, config):
     r"""Our ``MeanBackward``/``SumBackward``: share ``R_out`` over the
     reduced elements in proportion to ``|x|``. A native node saved
@@ -481,20 +416,19 @@ def install_mean_or_sum(node, config):
     raw_dim = node.dim
     keepdim = getattr(node, 'keepdim', False)
 
-    # reduction_share wants None or a tuple of ints.
+    # the rule wants None or a tuple of ints
     if raw_dim is None:
         dim = None
     elif isinstance(raw_dim, int):
         dim = (raw_dim,)
     else:
         dim = tuple(raw_dim)
-    _trace(None, 'reduction_share')
+    rule = REDUCTION_RULES[REDUCTION_RULES.default]
+    _trace(None, rule.__name__)
 
-    def _hook(gi, go, _act=activation, _dim=dim, _keepdim=keepdim,
-              _eps=config.eps):
-        R_out = go[0]
-        with torch.no_grad():
-            R_in = lrp_utils.reduction_share(_act, R_out, _dim, _keepdim, _eps)
+    def _hook(gi, go, _x=activation, _dim=dim, _keepdim=keepdim,
+              _eps=config.eps, _rule=rule):
+        R_in = _rule(_x, None, go[0], _eps, dim=_dim, keepdim=_keepdim)
         return as_grad_tuple(gi, {0: R_in})
 
     return node.register_hook(_hook)
@@ -504,166 +438,65 @@ def install_mean_or_sum(node, config):
 # Softmax variants (chosen by config.softmax)
 # ---------------------------------------------------------------------------
 
-def _install_softmax_saved(node, config, share_fn):
-    r"""Common installer for the softmax rules that read our ``Softmax``
-    node's saved ``(input, output)``: registers ``share_fn(x, s, dim, R_out)``
-    as the relevance map, or passes through when the forward did not go
-    through our node."""
+def _softmax_saved(node):
     saved = getattr(node, 'saved_tensors', None)
     if not saved or len(saved) < 2:
-        return install_passthrough(node, config)
-    x, s = saved[0], saved[1]
-    dim = getattr(node, 'dim', -1)
-
-    def _hook(gi, go, _x=x, _s=s, _dim=dim, _fn=share_fn):
-        R_in = _fn(_x, _s, _dim, go[0])
-        return as_grad_tuple(gi, {0: R_in})
-
-    return node.register_hook(_hook)
+        return None                          # not our Softmax: nothing saved
+    return {'x': saved[0], 'y': saved[1], 'dim': getattr(node, 'dim', -1)}
 
 
-def install_softmax_jacobian(node, config):
-    r"""Softmax Jacobian rule (Achtibat et al. 2024, Prop. 3.1) from our
-    ``Softmax`` node's saved input and output; passthrough when the
-    forward did not go through it.
-    """
-    return _install_softmax_saved(
-        node, config,
-        lambda x, s, dim, R: lrp_utils.softmax_jacobian(x, s, R, dim))
-
-def install_softmax_detach(node, config):
-    r"""Softmax output treated as a constant gate: ``R_in = s * R_out``.
-    Passthrough when the forward did not go through our ``Softmax``.
-    """
-    return _install_softmax_saved(
-        node, config,
-        lambda x, s, dim, R: lrp_utils.softmax_detach(s, R))
-
-
-# ---------------------------------------------------------------------------
-# LayerNorm variants (chosen by config.layernorm)
-# ---------------------------------------------------------------------------
-
-def _install_layernorm_saved(node, config, ln_fn):
-    r"""Common installer for the LayerNorm rules that need only the node's
-    saved input, normalized shape, weight and bias: registers
-    ``ln_fn(x, ns, w, b, R_out, eps)`` as the relevance map, or passes
-    through when the saved state is missing."""
+def _layernorm_saved(node):
     x = getattr(node, '_saved_input', None)
     ns = getattr(node, '_saved_normalized_shape', None)
-    w = getattr(node, '_saved_weight', None)
-    b = getattr(node, '_saved_bias', None)
     if x is None or ns is None:
-        return install_passthrough(node, config)
-
-    eps = config.eps
-
-    def _hook(gi, go, _x=x, _ns=ns, _w=w, _b=b, _eps=eps, _fn=ln_fn):
-        R_in = _fn(_x, _ns, _w, _b, go[0], _eps)
-        return as_grad_tuple(gi, {0: R_in})
-
-    return node.register_hook(_hook)
+        return None
+    return {'x': x, 'y': None, 'normalized_shape': ns,
+            'weight': getattr(node, '_saved_weight', None),
+            'bias': getattr(node, '_saved_bias', None),
+            'mean': getattr(node, '_saved_result1', None),
+            'rstd': getattr(node, '_saved_result2', None)}
 
 
-def install_layernorm_yx(node, config):
-    r"""LayerNorm ``y/x`` rule (Ali et al. 2022) from the node's saved input,
-    weight and bias; passthrough when they are missing.
-    """
-    return _install_layernorm_saved(node, config, lrp_utils.layernorm_yx)
-
-def install_layernorm_identity(node, config):
-    r"""Fused LayerNorm, the default: the bias takes its share, everything
-    else passes relevance through; equals the decomposed LayerNorm.
-    """
-    x = getattr(node, '_saved_input', None)
-    ns = getattr(node, '_saved_normalized_shape', None)
-    w = getattr(node, '_saved_weight', None)
-    b = getattr(node, '_saved_bias', None)
-    if x is None or ns is None:
-        return install_passthrough(node, config)
-    mean = getattr(node, '_saved_result1', None)
-    rstd = getattr(node, '_saved_result2', None)
-    eps = config.eps
-
-    def _hook(gi, go, _x=x, _ns=ns, _w=w, _b=b, _eps=eps,
-              _m=mean, _r=rstd):
-        R_in = lrp_utils.layernorm_identity(_x, _ns, _w, _b, go[0], _eps,
-                                            mean=_m, rstd=_r)
-        return as_grad_tuple(gi, {0: R_in})
-
-    return node.register_hook(_hook)
-
-
-def install_layernorm_detach_std(node, config):
-    r"""LayerNorm with the standard deviation held constant (Achtibat et al.
-    2024, Eq. 9, as in LXT); passthrough when the saved state is missing.
-    """
-    return _install_layernorm_saved(node, config, lrp_utils.layernorm_detach_std)
-
-
-# ---------------------------------------------------------------------------
-# Activation y/x (chosen by config.activation='yx')
-# ---------------------------------------------------------------------------
-
-# Forward activation function for a grad_fn, keyed by grad_fn name; the
-# lookup is an exact match on the name or on the name with trailing digits
-# stripped. Used when ``_saved_result`` is unavailable and ``y = f(x)``
-# must be recomputed.
-_ACTIVATION_FORWARD = {
-    'ReluBackward':        F.relu,
-    'LeakyReluBackward':   F.leaky_relu,
-    'GeluBackward':        F.gelu,
-    'SiluBackward':        F.silu,
-    'TanhBackward':        torch.tanh,
-    'SigmoidBackward':     torch.sigmoid,
-    'HardtanhBackward':    F.hardtanh,
-    'HardswishBackward':   F.hardswish,
-    'HardsigmoidBackward': F.hardsigmoid,
-    'EluBackward':         F.elu,
-    'SeluBackward':        F.selu,
-    'CeluBackward':        F.celu,
-    'SoftplusBackward':    F.softplus,
-    'SoftsignBackward':    F.softsign,
-    'LogSigmoidBackward':  F.logsigmoid,
-    'MishBackward':        F.mish,
-}
-
-
-def install_activation_yx(node, config):
-    r"""Activation ``y/x`` rule (Achtibat et al. 2024, Prop. 3.2) from the
-    saved output, recomputed from ``_ACTIVATION_FORWARD`` when the node did
-    not save it; passthrough otherwise.
-    """
-    name = node.name()
-    y = getattr(node, '_saved_result', None)
+def _activation_saved(node):
     x = getattr(node, '_saved_self', None)
-
-    # Need x; if only y is saved, recovering x is generally not possible.
     if x is None:
-        return install_passthrough(node, config)
-
+        return None                          # only the output saved: no rule
+    y = getattr(node, '_saved_result', None)
     if y is None:
-        fwd = None
-        for key, fn in _ACTIVATION_FORWARD.items():
-            if (key == name or key == name.rstrip('0123456789')):
-                fwd = fn
-                break
+        name = node.name()
+        fwd = next((fn for key, fn in ACTIVATION_FORWARD.items()
+                    if key in (name, name.rstrip('0123456789'))), None)
         if fwd is None:
-            return install_passthrough(node, config)
+            return None
         with torch.no_grad():
             y = fwd(x)
-
-    eps = config.eps
-
-    def _hook(gi, go, _x=x, _y=y, _eps=eps):
-        R_out = go[0]
-        R_in = lrp_utils.activation_yx(_x, _y, R_out, _eps)
-        return as_grad_tuple(gi, {0: R_in})
-
-    return node.register_hook(_hook)
+    return {'x': x, 'y': y}
 
 
-# ---- passthrough and shape routing -----------------------------------
+def _unary_installer(kind, read_saved, rule):
+    r"""The installer for one entry of a unary rule table: read what the
+    node saved with ``read_saved``, register a hook that calls
+    ``rule(x, y, R_out, eps, **saved)``. When the node saved nothing the
+    rule needs, relevance passes through."""
+    def install(node, config):
+        if rule is _rules_passthrough:
+            return install_passthrough(node, config)
+        saved = read_saved(node)
+        if saved is None:
+            return install_passthrough(node, config)
+        x, y = saved.pop('x'), saved.pop('y')
+        eps = config.eps
+
+        def _hook(gi, go, _x=x, _y=y, _saved=saved):
+            with torch.no_grad():
+                R_in = rule(_x, _y, go[0], eps, **_saved)
+            return as_grad_tuple(gi, {0: R_in})
+        return node.register_hook(_hook)
+    install.__name__ = f'install_{kind}_{rule.__name__}'
+    return install
+
+
+# ---- passthrough -----------------------------------------------------
 
 def install_passthrough(node, config):
     r"""``R_in = R_out`` into slot 0: activations, norms, softmax under the
@@ -762,6 +595,7 @@ def install_sdpa(node, config):
         mask = getattr(node, '_saved_attn_bias', None)
     is_causal = bool(getattr(node, '_saved_is_causal', False))
     scale = getattr(node, '_saved_scale', None)
+    eps = config.eps
     # One node stands for softmax and two products; each product is
     # resolved on its own, as the decomposed graph would.
     ps = parents(node, skip_aliases=False)
@@ -775,7 +609,7 @@ def install_sdpa(node, config):
     _trace(None, f'softmax={softmax_name}')
 
     def _hook(gi, go, _q=q, _k=k, _v=v, _lse=lse, _mask=mask,
-              _is_causal=is_causal, _scale=scale,
+              _is_causal=is_causal, _scale=scale, _eps=eps,
               _av=_av, _qk=_qk, _softmax=softmax_name):
         with torch.no_grad():
             R_out = go[0]
@@ -794,13 +628,7 @@ def install_sdpa(node, config):
             R_A = torch.zeros_like(Af) if R_A is None else R_A
             R_V = torch.zeros_like(Vf) if R_V is None else R_V
             # softmax: R_A -> R_scores (relevance at the scaled-masked scores)
-            if _softmax == 'jacobian':
-                R_scores = lrp_utils.softmax_jacobian(
-                    fl(scores), fl(A), R_A, dim=-1)
-            elif _softmax == 'detach':
-                R_scores = lrp_utils.softmax_detach(fl(A), R_A)
-            else:                                                 # passthrough
-                R_scores = R_A
+            R_scores = SOFTMAX_RULES[_softmax](fl(scores), fl(A), R_A, _eps, dim=-1)
             # The `*scale` is a constant multiplication: relevance passes
             # through it unchanged, as in the decomposed path.
             Qf, Ktf = fl(_q), fl(k_e.transpose(-2, -1))
@@ -830,21 +658,33 @@ def install_sdpa(node, config):
 # ---------------------------------------------------------------------------
 
 SOFTMAX_HANDLERS: dict = {
-    'passthrough': install_passthrough,
-    'jacobian':    install_softmax_jacobian,
-    'detach':      install_softmax_detach,
-}
-
+    name: _unary_installer('softmax', _softmax_saved, fn)
+    for name, fn in SOFTMAX_RULES.items()}
 
 LAYERNORM_HANDLERS: dict = {
-    'identity':    install_layernorm_identity,
-    'passthrough': install_passthrough,
-    'yx':          install_layernorm_yx,
-    'detach_std':  install_layernorm_detach_std,
-}
-
+    name: _unary_installer('layernorm', _layernorm_saved, fn)
+    for name, fn in LAYERNORM_RULES.items()}
 
 ACTIVATION_HANDLERS: dict = {
-    'passthrough': install_passthrough,
-    'yx':          install_activation_yx,
+    name: _unary_installer('activation', _activation_saved, fn)
+    for name, fn in ACTIVATION_RULES.items()}
+
+
+ACTIVATION_FORWARD = {
+    'ReluBackward':        F.relu,
+    'LeakyReluBackward':   F.leaky_relu,
+    'GeluBackward':        F.gelu,
+    'SiluBackward':        F.silu,
+    'TanhBackward':        torch.tanh,
+    'SigmoidBackward':     torch.sigmoid,
+    'HardtanhBackward':    F.hardtanh,
+    'HardswishBackward':   F.hardswish,
+    'HardsigmoidBackward': F.hardsigmoid,
+    'EluBackward':         F.elu,
+    'SeluBackward':        F.selu,
+    'CeluBackward':        F.celu,
+    'SoftplusBackward':    F.softplus,
+    'SoftsignBackward':    F.softsign,
+    'LogSigmoidBackward':  F.logsigmoid,
+    'MishBackward':        F.mish,
 }

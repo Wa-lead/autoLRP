@@ -226,7 +226,7 @@ def _two_tensors(args, kwargs):
 @register_rewrite('add')
 def wrap_add(func, args, kwargs):
     r"""Route two-tensor add through :class:`Add` (saves operands for
-    the proportional/residual split). A scalar operand declines to
+    the proportional split). A scalar operand declines to
     native, where the constant acts as a bias."""
     pair = _two_tensors(args, kwargs)
     if pair is None:

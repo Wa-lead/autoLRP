@@ -35,12 +35,11 @@ from .backward.strategies import (
     register_installer, installer, merge, match_installer, is_shape_node,
     EXPLICIT_STRATEGY, INSTALLERS,
 )
-from .backward.analysis import (
-    register_analyzer, ANALYZERS, node_facts,
-)
+from .backward.analysis import register_analyzer, ANALYZERS
+from .backward.graph import node_facts
 from .backward.engine import graph_lrp, walk, plan_report, explain, explain_summary
 from .recipes import bilrp, clrp
-from . import eval
+from . import metrics
 
 __all__ = [
     'LRPConfig', 'BASE', 'LRPTensor', 'tensor',
@@ -51,5 +50,5 @@ __all__ = [
     'is_shape_node', 'EXPLICIT_STRATEGY', 'INSTALLERS',
     'register_analyzer', 'ANALYZERS', 'node_facts',
     'graph_lrp', 'walk', 'plan_report', 'explain', 'explain_summary',
-    'bilrp', 'clrp', 'eval',
+    'bilrp', 'clrp', 'metrics',
 ]

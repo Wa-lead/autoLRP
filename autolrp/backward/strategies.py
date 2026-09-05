@@ -8,6 +8,7 @@ user config keys are matched exactly (:mod:`autolrp.backward.resolve`).
 from typing import Callable, Dict, Optional
 
 from .install import (
+    ACTIVATION_FORWARD,
     install_addmm, install_mm, install_conv, install_bmm, install_sdpa,
     install_mean_or_sum, install_norm, install_cumsum, install_mul, install_div,
     install_add, install_passthrough, install_noop,
@@ -27,12 +28,7 @@ Installer = Callable
 # so the listings cannot drift apart.
 # ---------------------------------------------------------------------------
 
-_ACTIVATION_PATTERNS = (
-    'LeakyReluBackward', 'ReluBackward', 'GeluBackward', 'SiluBackward',
-    'TanhBackward', 'SigmoidBackward', 'HardtanhBackward', 'HardswishBackward',
-    'HardsigmoidBackward', 'EluBackward', 'SeluBackward', 'CeluBackward',
-    'SoftplusBackward', 'SoftsignBackward', 'LogSigmoidBackward', 'MishBackward',
-)
+_ACTIVATION_PATTERNS = tuple(ACTIVATION_FORWARD)   # the one list of activation names lives in install.py
 
 _LAYERNORM_PATTERNS = ('NativeLayerNormBackward', 'LayerNormBackward')
 
@@ -219,13 +215,13 @@ def _dispatcher(config_attr: str, handlers: Dict[str, Callable]) -> Callable:
         spec = getattr(config, config_attr)
         name, _ = resolve(spec, node)
         handler = name if callable(name) else handlers[name]
-        from . import install as _install
-        n = len(_install._TRACE) if _install._TRACE is not None else 0
+        from . import resolve as _resolve
+        n = len(_resolve._TRACE) if _resolve._TRACE is not None else 0
         h = handler(node, config)
-        if _install._TRACE is not None:           # explain(): report the field, not the handler's own line
-            del _install._TRACE[n:]
+        if _resolve._TRACE is not None:           # explain(): report the field, not the handler's own line
+            del _resolve._TRACE[n:]
             label = name if isinstance(name, str) else getattr(name, '__name__', 'callable')
-            _install._TRACE.append((None, f"{config_attr}={label}"))
+            _resolve._TRACE.append((None, f"{config_attr}={label}"))
         return h
     install.__name__ = f'install_dispatched_{config_attr}'
     return install

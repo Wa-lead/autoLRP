@@ -7,7 +7,7 @@ Skip with ``AUTOLRP_SKIP_SELFCHECK=1``."""
 import os
 
 import torch
-from .backward.analysis import parents
+from .backward.graph import parents
 
 
 def _probe_graphs():

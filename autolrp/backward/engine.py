@@ -15,7 +15,7 @@ from .strategies import (
     build_strategy,
 )
 from ..config import LRPConfig
-from .analysis import leaf_reach, parents
+from .graph import leaf_reach, parents, bfs_order, is_leaf, is_input_leaf
 
 
 PlanItem = Tuple[object, Optional[Callable]]   # (node, installer or None)
@@ -33,7 +33,7 @@ def plan_report(plan) -> dict:
     report = {'rule': [], 'native_fallback': [], 'leaves': 0}
     for node, installer in plan:
         name = node.name()
-        if 'AccumulateGrad' in name:
+        if is_leaf(node):
             report['leaves'] += 1
         elif installer is None:
             report['native_fallback'].append(name)
@@ -64,18 +64,9 @@ def walk(output: torch.Tensor,
     if output.grad_fn is None:
         return plan
 
-    visited = set()
-    queue = [output.grad_fn]
-    while queue:
-        node = queue.pop(0)
-        if node is None or id(node) in visited:
-            continue
-        visited.add(id(node))
+    for node in bfs_order([output.grad_fn]):
         _, installer = match_installer(node.name(), strategy)
         plan.append((node, installer))
-        for parent in parents(node, skip_aliases=False):
-            if parent is not None and id(parent) not in visited:
-                queue.append(parent)
 
     # An unmatched node matters only on the path to a wrapped input;
     # one that reaches no input (an embedding lookup of ids, a
@@ -83,7 +74,7 @@ def walk(output: torch.Tensor,
     reach = leaf_reach([n for n, _ in plan])
     for node, installer in plan:
         name = node.name()
-        if (installer is None and 'AccumulateGrad' not in name
+        if (installer is None and not is_leaf(node)
                 and reach.get(id(node), False)
                 and name not in _UNMATCHED_WARNED):
             _UNMATCHED_WARNED.add(name)
@@ -108,17 +99,17 @@ def explain(output: torch.Tensor, config=None, strategy=None):
     removed again; no backward runs. :func:`explain_summary` formats the
     rows as a printable table string.
     """
-    from . import install as _install
+    from . import resolve as _resolve
     if config is None:
         config = LRPConfig()
     plan = walk(output, strategy=strategy or build_strategy(config), config=config)
     analysis.run(plan)
     rows, handles = [], []
-    _install._TRACE = trace = []
+    _resolve._TRACE = trace = []
     try:
         for node, installer in plan:
             name = node.name()
-            if 'AccumulateGrad' in name:
+            if is_leaf(node):
                 continue
             if installer is None:
                 rows.append((name, None, 'native gradient'))
@@ -135,7 +126,7 @@ def explain(output: torch.Tensor, config=None, strategy=None):
             else:
                 rows.append((name, None, installer.__name__))
     finally:
-        _install._TRACE = None
+        _resolve._TRACE = None
         for h in handles:
             h.remove()
     return rows
@@ -281,8 +272,7 @@ def graph_lrp(output: torch.Tensor,
     # A wrapped input leaf must be reachable. `_lrp_init` is set by
     # tensor() and dropped by detach(), so a `.detach().requires_grad_()`
     # inside the forward, which severs the path, fails this check.
-    if not any('AccumulateGrad' in n.name()
-               and getattr(getattr(n, 'variable', None), '_lrp_init', False)
+    if not any(is_input_leaf(n)
                and not isinstance(getattr(n, 'variable', None),
                                   torch.nn.Parameter)
                for n, _ in plan):

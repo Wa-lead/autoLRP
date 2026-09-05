@@ -104,7 +104,7 @@ out[0, pred].lrp(config=LRPConfig(attn='cplrp'))
 pass already built:
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/pipeline.png?v=3" width="100%">
+  <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/pipeline.png?v=4" width="100%">
 </p>
 
 1. **wrap.** `autolrp.tensor(x)` marks the input. A handful of ops (`add`,

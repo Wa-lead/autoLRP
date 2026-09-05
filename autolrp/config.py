@@ -28,11 +28,9 @@ from dataclasses import dataclass, field
 from typing import Dict, Union
 
 from .backward.rules import (FAMILIES, LINEAR_RULES, MUL_RULES, BMM_RULES,
-                             ADD_RULES, VIRTUAL_RULES)
+                             ADD_RULES, SOFTMAX_RULES, LAYERNORM_RULES,
+                             ACTIVATION_RULES, VIRTUAL_RULES)
 from .backward.analysis import ANALYZERS
-from .backward.install import (
-    SOFTMAX_HANDLERS, LAYERNORM_HANDLERS, ACTIVATION_HANDLERS,
-)
 from .backward.strategies import UNARY_NODES
 from .backward.resolve import RuleSpec, canonical, _normalize
 
@@ -204,9 +202,9 @@ class LRPConfig:
         object.__setattr__(self, 'rule', rule)
 
         _validate_rule(self.rule)
-        _validate_unary('softmax',    self.softmax,    SOFTMAX_HANDLERS)
-        _validate_unary('layernorm',  self.layernorm,  LAYERNORM_HANDLERS)
-        _validate_unary('activation', self.activation, ACTIVATION_HANDLERS)
+        _validate_unary('softmax',    self.softmax,    SOFTMAX_RULES)
+        _validate_unary('layernorm',  self.layernorm,  LAYERNORM_RULES)
+        _validate_unary('activation', self.activation, ACTIVATION_RULES)
         if not (0.0 < self.relevance_filter <= 1.0):
             raise ValueError(
                 f"relevance_filter must be in (0, 1], "

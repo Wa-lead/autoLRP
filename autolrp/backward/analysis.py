@@ -14,6 +14,8 @@ from typing import Callable, Dict
 
 import torch
 
+from .graph import parents, leaf_reach, operands, _reaches_input_avoiding, is_leaf
+
 
 # ---------------------------------------------------------------------------
 # Registry
@@ -73,138 +75,12 @@ def run(plan) -> None:
                         f"conflict on a fact name")
                 md[k] = v
 
-def node_facts(node) -> dict:
-    r"""Return ``node.metadata['lrp']`` or an empty dict. Safe on
-    stand-in nodes that lack ``metadata``."""
-    md = getattr(node, 'metadata', None)
-    if isinstance(md, dict):
-        return md.get('lrp', {})
-    return {}
-
 
 # ---------------------------------------------------------------------------
-# Which subgraphs reach a wrapped input
-# ---------------------------------------------------------------------------
-
-
-def is_weight_leaf(var) -> bool:
-    """A leaf that carries no relevance of its own. Relevance flows to
-    what the user wrapped with :func:`autolrp.tensor`; every other leaf,
-    an ``nn.Parameter``, a constant the forward intercept made live, a
-    plain tensor with ``requires_grad``, is a weight."""
-    return not getattr(var, '_lrp_init', False)
-
-
-def leaf_reach(nodes) -> Dict[int, bool]:
-    r"""``reach[id(fn)] = True`` iff ``fn``'s subgraph contains a wrapped
-    input leaf (:func:`is_weight_leaf`). One post-order pass over the
-    union of the given subgraphs.
-    """
-    reach: Dict[int, bool] = {}
-    for root in nodes:
-        if root is None or id(root) in reach:
-            continue
-        stack = [(root, False)]
-        while stack:
-            fn, post = stack.pop()
-            if fn is None:
-                continue
-            fid = id(fn)
-            if post:
-                reach[fid] = any(
-                    reach.get(id(p), False)
-                    for p in parents(fn, skip_aliases=False)
-                    if p is not None)
-                continue
-            if fid in reach:
-                continue
-            if 'AccumulateGrad' in fn.name():
-                var = getattr(fn, 'variable', None)
-                reach[fid] = not is_weight_leaf(var)
-                continue
-            reach[fid] = False           # placeholder; fixed on post-visit
-            stack.append((fn, True))
-            for p in parents(fn, skip_aliases=False):
-                if p is not None and id(p) not in reach:
-                    stack.append((p, False))
-    return reach
-
-
-def reaches_input(fn) -> bool:
-    """``True`` iff ``fn`` reaches a wrapped input leaf. A parameter or a
-    constant (including a constant made live by the forward intercept)
-    does not; only the path from the user's ``tensor(...)`` does."""
-    return _reaches_input_avoiding(fn, None)
-
-
-def _reaches_input_avoiding(start_fn, forbidden_fn) -> bool:
-    r"""``True`` iff ``start_fn`` reaches an input leaf without passing
-    through ``forbidden_fn``.
-    """
-    if start_fn is None:
-        return False
-    seen = set()
-    stack = [start_fn]
-    while stack:
-        fn = stack.pop()
-        if fn is None or fn is forbidden_fn:
-            continue
-        fid = id(fn)
-        if fid in seen:
-            continue
-        seen.add(fid)
-        if 'AccumulateGrad' in fn.name():
-            var = getattr(fn, 'variable', None)
-            if not is_weight_leaf(var):
-                return True
-            continue                      # parameter leaf: keep searching
-        for parent in parents(fn, skip_aliases=False):
-            if parent is not None and parent is not forbidden_fn:
-                stack.append(parent)
-    return False
-
-
-# ---------------------------------------------------------------------------
-# statistic_operand
+# statistic_operand, and its cancellation test
 # ---------------------------------------------------------------------------
 
 _CANDIDATE_FAMILIES = ('MulBackward', 'DivBackward', 'SubBackward')
-
-
-def _skip_aliases(fn):
-    r"""Collapse a chain of ``AliasBackward`` nodes to the first real op;
-    the subclass inserts an alias at every op boundary, and anchoring a
-    path test on the alias lets a sibling path slip past it.
-    """
-    while fn is not None and 'AliasBackward' in fn.name():
-        nfs = getattr(fn, 'next_functions', ())
-        fn = nfs[0][0] if nfs else None
-    return fn
-
-
-def parents(node, skip_aliases: bool = True):
-    r"""Producing nodes of ``node``'s operand slots, in slot order; ``None``
-    for a slot with no producer. With ``skip_aliases`` (default) chains
-    of ``AliasBackward`` are collapsed to the first real op.
-    """
-    ps = [q for q, _ in getattr(node, 'next_functions', ())]
-    return [_skip_aliases(q) for q in ps] if skip_aliases else ps
-
-
-def operands(node):
-    r"""Saved operand tensors ``(a, b)`` of a two-operand node, or
-    ``(None, None)``; native ops save ``_saved_self``/``_saved_other``,
-    our wrapped ops save through ``saved_tensors``.
-    """
-    a = getattr(node, '_saved_self', None)
-    b = getattr(node, '_saved_other', None)
-    if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
-        return a, b
-    saved = getattr(node, 'saved_tensors', None)
-    if saved and len(saved) >= 2 and all(isinstance(t, torch.Tensor) for t in saved[:2]):
-        return saved[0], saved[1]
-    return None, None
-
 
 _CANCEL_TOL = 1e-4      # fractional change in z per fractional change in src;
                         # true cancellations read ~1e-13, everything else >= ~0.4
@@ -336,8 +212,8 @@ def input_conv(nodes) -> Dict[object, str]:
         saved_inp = getattr(n, '_saved_input', None)
         if saved_inp is None or saved_inp.ndim < 4 or saved_inp.shape[1] > 4:
             continue
-        for parent_fn in parents(n, skip_aliases=False):
-            if parent_fn is not None and 'AccumulateGrad' in parent_fn.name():
+        for parent in parents(n, skip_aliases=False):
+            if parent is not None and is_leaf(parent):
                 out[n] = 'input_conv'
                 break
     return out

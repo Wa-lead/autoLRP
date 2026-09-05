@@ -18,8 +18,9 @@ import torch.nn as nn
 import torch as _torch
 
 from autolrp.backward.lrp_utils import (
-    run_linear_rule, reduction_share, stabilize, mm_ops,
+    run_linear_rule, stabilize, mm_ops,
 )
+from autolrp.backward.rules import reduction_proportional
 from tests._cfg import on_linear
 from autolrp import BASE
 from autolrp.backward.rules import (
@@ -53,7 +54,8 @@ def compute_bmm_r_in(a, b, R_out, eps, bilinear):
                                           fwd, bwd_a, bwd_b)
 
 
-compute_reduction_r_in = reduction_share
+def compute_reduction_r_in(x, R_out, dim, keepdim, eps):
+    return reduction_proportional(x, None, R_out, eps, dim=dim, keepdim=keepdim)
 
 
 # ---------------------------------------------------------------------------
@@ -473,7 +475,7 @@ class TestInputConvFact:
         return plan
 
     def test_zbox_only_at_input_conv(self):
-        from autolrp.backward.analysis import node_facts
+        from autolrp.backward.graph import node_facts
         cfg = LRPConfig(rule={**BASE, 'input_conv': self.ZB})
         plan = self._facts_plan(cfg)
         input_fn, interior = None, []
@@ -493,7 +495,7 @@ class TestInputConvFact:
         the other convs. The input conv matches BOTH 'input_conv' (fact)
         and 'ConvolutionBackward' (name); the fact tier must win —
         structural facts are more specific than any name substring."""
-        from autolrp.backward.analysis import node_facts
+        from autolrp.backward.graph import node_facts
         cfg = LRPConfig(rule={**BASE, 'input_conv': self.ZB,
                               'ConvolutionBackward': 'zplus'})
         plan = self._facts_plan(cfg)
@@ -518,3 +520,68 @@ class TestInputConvFact:
                 continue
             fn, _ = _dispatch(cfg, node)
             assert fn is epsilon
+
+
+class TestBiasSplit:
+    def test_layernorm_identity_is_the_bias_split(self):
+        from autolrp.backward.lrp_utils import apply_bias_split
+        from autolrp.backward.rules import layernorm_identity, _normalized
+        x = torch.tensor([[1., 2., 3., 6.]]); w = torch.tensor([2., 1., 1., .5]); b = torch.tensor([.5, 0., 0., -.5])
+        R = torch.ones(1, 4)
+        got = layernorm_identity(x, None, R, 1e-11, normalized_shape=(4,), weight=w, bias=b)
+        want = apply_bias_split(R, _normalized(x, (4,), 1e-11) * w, b, 1e-11)
+        assert torch.equal(got, want)
+
+    def test_raw_conv_bias_is_a_caller_error(self):
+        from autolrp.backward.lrp_utils import apply_bias_split
+        z = torch.randn(1, 4, 8, 8); R = torch.ones_like(z)
+        with pytest.raises(ValueError, match=r"\(1, C, 1"):
+            apply_bias_split(R, z, torch.randn(4), 1e-11)
+        out = apply_bias_split(R, z, torch.randn(4).view(1, 4, 1, 1), 1e-11)
+        assert out.shape == z.shape and not torch.equal(out, R)
+
+
+class TestFusedLayerNormEqualsDecomposed:
+    """The fused LayerNorm rules reproduce the decomposed graph: 'identity'
+    matches the statistical route (mean and std detached), 'detach_std'
+    matches detaching only the std (centering propagated)."""
+
+    class _Decomposed(nn.Module):
+        def __init__(self, d):
+            super().__init__()
+            self.w = nn.Parameter(torch.randn(d) * 0.5 + 1.0)
+            self.b = nn.Parameter(torch.randn(d) * 0.3)
+
+        def forward(self, x):
+            xc = x - x.mean(-1, keepdim=True)
+            xn = xc / (xc.pow(2).mean(-1, keepdim=True) + 1e-5).sqrt()
+            return xn * self.w + self.b
+
+    def _pair(self):
+        torch.manual_seed(0)
+        dec = self._Decomposed(16).eval()
+        fused = nn.LayerNorm(16, eps=1e-5).eval()
+        with torch.no_grad():
+            fused.weight.copy_(dec.w); fused.bias.copy_(dec.b)
+        head = nn.Linear(16, 3, bias=False).eval()
+        data = torch.randn(1, 4, 16)
+        def run(ln, cfg):
+            x = autolrp.tensor(data.clone())
+            head(ln(x)[:, 0])[0, 1].lrp(config=cfg)
+            return x.relevance.detach()
+        return dec, fused, run
+
+    def test_identity_matches_statistical_route(self):
+        dec, fused, run = self._pair()
+        r_dec = run(dec, LRPConfig())                            # statistic_operand detaches mean and std
+        r_fus = run(fused, LRPConfig(layernorm='identity'))
+        torch.testing.assert_close(r_fus, r_dec, atol=1e-6, rtol=0)
+
+    def test_detach_std_matches_std_only_detached(self):
+        dec, fused, run = self._pair()
+        no_stat = {k: v for k, v in BASE.items() if k != 'statistic_operand'}
+        r_dec = run(dec, LRPConfig(rule={**no_stat, 'SubBackward': 'proportional',
+                                          'DivBackward': 'detach_rhs', 'MulBackward': 'detach_rhs'}))
+        r_fus = run(fused, LRPConfig(layernorm='detach_std'))
+        torch.testing.assert_close(r_fus, r_dec, atol=1e-6, rtol=0)
+        assert abs(float(r_fus.sum()) - float(r_dec.sum())) < 1e-6   # and both conserve alike
