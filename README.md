@@ -8,20 +8,23 @@
 [![Python](https://img.shields.io/pypi/pyversions/autolrp)](https://pypi.org/project/autoLRP/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-A model agnostic PyTorch implementation of Layer-wise Relevance Propagation.
-It works at the operation level, so it needs no module rewriting and no module
-names: wrap your input in `autolrp.tensor()`, run the model as it is, pick an
-output scalar, and call `.lrp()`. It follows the philosophy of autograd, hence
-*autoLRP*.
+Layer-wise Relevance Propagation propagates a logit back to the input space
+under one constraint: the logit equals the sum of the relevance that reaches
+the input.
+
+This is a model-agnostic PyTorch implementation. It works at the operation
+level, so it needs no module rewriting and no module names. It acts on the
+torch operations the forward pass ran, following the philosophy of autograd,
+hence *autoLRP*.
 
 ```python
 import autolrp
-from autolrp import LRPConfig, BASE
 
-x = autolrp.tensor(image)          # the input you want relevance for
-out = model(x)                     # run the model unchanged
-out[0, pred].lrp()                 # relevance of class `pred`
-heatmap = x.relevance              # same shape as `image`
+
+x = autolrp.tensor(model_input)    # wrap the model input
+out = model(x)                     # run the model
+out[0, pred].lrp()                 # pick the class logit, call .lrp()
+relevance_map = x.relevance        # same shape as model_input
 ```
 
 ```bash
@@ -107,68 +110,48 @@ pass already built:
   <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/pipeline.png?v=4" width="100%">
 </p>
 
-1. **wrap.** `autolrp.tensor(x)` marks the input. A handful of ops (`add`,
-   `sum`, `softmax`, fused attention, and a few more) are replaced by versions
-   that save the activations the rules need. Gradients stay native, so the graph
-   is otherwise unchanged.
+1. **wrap.** `autolrp.tensor(x)` marks the input. A handful of ops are replaced
+   by versions that save the activations the rules need, and fused attention is
+   written out as ordinary ops. Gradients stay native, so the graph is
+   otherwise unchanged.
 2. **walk.** After the forward pass, the autograd graph is traversed into an
    ordered plan of nodes.
 3. **analyze.** Analyzers tag nodes with *facts*, for example which operand of
    an attention product is the softmax weights.
 4. **resolve.** Each node gets one rule, chosen by the config from a fact on the
    node when it has one, otherwise from the node name.
-5. **backward.** One `backward` pass runs those rules as hooks that turn the
-   incoming gradient into relevance. Whatever reaches the wrapped input is
-   `x.relevance`.
+5. **backward.** One pass back to the wrapped input runs those rules as hooks
+   that turn the incoming gradient into relevance. What reaches the input is
+   `x.relevance`; the model's own `.grad` is never touched.
 
 ## Configuration
 
-Every rule-bearing node is addressed by its autograd name without the version
-digit, or by a fact an analyzer attached to it. `BASE` is the starting table:
+A node is addressed by its autograd name without the version digit, or by a
+fact an analyzer attached to it. `BASE` is the starting table; override entries
+on it, or use a preset:
 
 ```python
->>> print(BASE)
-{'AddmmBackward': 'epsilon', 'MmBackward': 'epsilon', 'ConvolutionBackward': 'epsilon',
- 'BmmBackward': 'epsilon', 'MulBackward': 'proportional', 'DivBackward': 'proportional',
- 'AddBackward': 'proportional', 'SubBackward': 'proportional',
- 'statistic_operand': ('detach', {'by': 'statistic_operand'})}
-```
+from autolrp import LRPConfig, BASE, CPLRP, ATTNLRP, UNIFORM, on, ELEMENTWISE_NODES
 
-Override entries on it, or use a preset:
-
-```python
 LRPConfig(rule={**BASE, 'AddmmBackward': 'zplus'})
 LRPConfig(rule={**BASE, 'ConvolutionBackward': ('gamma', {'gamma': 0.25})})
+LRPConfig(rule={**BASE, **on(ELEMENTWISE_NODES, 'yx')})
 LRPConfig.composite()                 # z+ on conv, epsilon elsewhere
-LRPConfig(rule={**BASE, **ATTNLRP})   # epsilon products, Jacobian softmax
-LRPConfig(rule={**BASE, **CPLRP})     # attention weights treated as constants
+LRPConfig(rule={**BASE, **ATTNLRP})
+LRPConfig(rule={**BASE, **CPLRP})
 LRPConfig(rule={**BASE, **UNIFORM})
 ```
 
-The config says exactly what runs. A key that is not a node name or a
-registered fact, a rule the key's family cannot run, and a node that no entry
-addresses are all errors:
+`print(BASE)` lists every key and the rule it runs. The config says exactly
+that: a key that is not a node name or a registered fact, a rule the key cannot
+run, and a node that no entry addresses are all errors.
 
 ```
 LRPConfig(rule={**BASE, 'linear': 'zplus'})
   ValueError: unknown rule key 'linear': not a node name [...]
 LRPConfig(rule={**BASE, 'MulBackward': 'zbox'})
-  ValueError: rule entry 'MulBackward'='zbox': 'zbox' is not a choice here. Choices: [...]
+  ValueError: rule entry 'MulBackward'='zbox': 'zbox' is not a choice here. Choices: ['proportional']
 ```
-
-Rule tables, by kind of two-operand node:
-
-| kind    | node names                                                          | rules                                                                                 |
-| ------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| product | `AddmmBackward`, `MmBackward`, `BmmBackward`, `ConvolutionBackward` | `epsilon`, `zplus`, `gamma`, `gamma_montavon`, `alpha_beta`, `zbox`, `gradient_input` |
-| mul     | `MulBackward`, `DivBackward`                                        | `proportional`, `passthrough`                                                         |
-| add     | `AddBackward`, `SubBackward`                                        | `proportional`, `equal`, `fixed`, `passthrough`                                       |
-
-A product attributes the operand that comes from the wrapped input, or both
-with half the relevance each when both do (the fact `bilinear`). An entry can
-say which with `attribute`, `('zplus', {'attribute': 'rhs'})`. The fact
-`attention_weights` names the softmax side of an attention product; `CPLRP`
-is `{'bilinear': ('detach', {'by': 'attention_weights'})}`.
 
 ## Citing
 
