@@ -57,7 +57,7 @@ def _autolrp_R(model, x_data, target_idx, rule):
     x = autolrp.tensor(x_data.clone())
     out = model(x)
     out[0, target_idx].lrp(
-        config=LRPConfig(rule=on_linear(rule), activation='passthrough'),
+        config=LRPConfig(rule=on_linear(rule)),
     )
     return x.relevance[0].detach().clone()
 

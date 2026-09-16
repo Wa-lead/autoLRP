@@ -5,7 +5,7 @@ for the attribution side). Every autoLRP script imports build_config() so the
 recipe lives in exactly one place.
 
 Config vocabulary (current library): rule= is a dict keyed by exact canonical
-node names ('AddmmBackward') or analyzer fact names ('weights_operand');
+node names ('AddmmBackward') or analyzer fact names ('bilinear', 'attention_weights');
 there are no aliases and no 'default' sentinel — start from autolrp.BASE and
 override entries. A node no key addresses is a hard error.
 
@@ -15,14 +15,15 @@ The text/EQA configuration:
                 for nn.Linear-with-bias and MmBackward for matmul-without-bias,
                 so gamma is keyed on both; every other family keeps its BASE
                 entry (epsilon on conv/bmm, proportional on mul/add).
-    softmax:    'passthrough' for the baseline text/EQA config; 'jacobian'
-                (the AttnLRP-style DeepTaylor softmax, attn='attnlrp') as the
-                ablation/fix where noted.
-    layernorm:  'passthrough' -- all R to the input. (The library default is
-                'identity', so this must be set explicitly.)
-    activation: 'passthrough'.
-    attention:  QK^T / attn*V are BmmBackward. BASE's 'BmmBackward': 'epsilon'
-                is the bilinear epsilon with the 2z denominator — the knob
+    softmax:    on(SOFTMAX_NODES, 'passthrough') for the baseline text/EQA
+                config; 'jacobian' (the AttnLRP-style DeepTaylor softmax, the
+                ATTNLRP fragment) as the ablation/fix where noted.
+    layernorm:  on(LAYERNORM_NODES, 'passthrough') -- all R to the input. (The
+                library default is 'identity', so this is set explicitly.)
+    activation: 'passthrough', the BASE entry.
+    attention:  QK^T / attn*V are bmm nodes with both operands from the
+                input, the fact 'bilinear'. Under BASE they run epsilon on
+                both operands with half the relevance each — the knob
                 formerly spelled bilinear='full'.
 
   gamma_linear: 1.0 for text (IMDB/Wiki), 0.001 for EQA (BERT/RoBERTa/T5);
@@ -45,20 +46,18 @@ EQA_GAMMA = 0.001
 def apply_bilinear(rule: dict, choice: str) -> None:
     r"""Write the historic bilinear= knob into exact-key rule entries.
 
-    'full'    -> BmmBackward epsilon (2z-denominator bilinear epsilon)
-    'uniform' -> BmmBackward uniform (AttnLRP's uniform split)
-    'cplrp'   -> BmmBackward epsilon + detach the softmax-weights operand
-                 (Ali et al. 2022), same entries attn='cplrp' compiles to.
+    'full'    -> no 'bilinear' entry: BASE, epsilon on both operands
+    'uniform' -> the UNIFORM fragment, gradient times input on both (LXT)
+    'cplrp'   -> the CPLRP fragment: detach the softmax-weights operand
+                 (Ali et al. 2022)
     """
+    from autolrp import CPLRP, UNIFORM
     if choice == 'full':
-        rule['BmmBackward'] = 'epsilon'
-        rule.pop('weights_operand', None)
+        rule.pop('bilinear', None)
     elif choice == 'uniform':
-        rule['BmmBackward'] = 'uniform'
-        rule.pop('weights_operand', None)
+        rule.update(UNIFORM)
     elif choice == 'cplrp':
-        rule['BmmBackward'] = 'epsilon'
-        rule['weights_operand'] = ('detach', {'by': 'weights_operand'})
+        rule.update(CPLRP)
     else:
         raise ValueError(f"bilinear choice {choice!r}; "
                          "expected 'full', 'uniform' or 'cplrp'")
@@ -87,13 +86,10 @@ def build_config(gamma_linear: float, *, softmax: str = 'passthrough'):
     Returns:
         LRPConfig instance.
     """
-    from autolrp import LRPConfig
-    return LRPConfig(
-        rule=make_rule(gamma_linear=gamma_linear),
-        softmax=softmax,
-        layernorm='passthrough',
-        activation='passthrough',
-    )
+    from autolrp import LRPConfig, on, SOFTMAX_NODES, LAYERNORM_NODES
+    return LRPConfig(rule={**make_rule(gamma_linear=gamma_linear),
+                           **on(SOFTMAX_NODES, softmax),
+                           **on(LAYERNORM_NODES, 'passthrough')})
 
 
 def build_text_config(gamma_linear: float = TEXT_GAMMA, *, softmax='passthrough'):
@@ -147,14 +143,11 @@ def build_vit_config(conv_gamma: float = VIT_CONV_GAMMA, mm_gamma: float = VIT_M
                      *, softmax: str = 'jacobian', bilinear: str = 'full'):
     r"""ViT config: gamma on the patch-embed conv (125) AND the transformer
     linears (0.001), BmmBackward epsilon on attention, epsilon elsewhere.
-    softmax='jacobian' (the fix): passthrough under-attributes the attention
+    softmax 'jacobian' (the fix): passthrough under-attributes the attention
     block (+0.3700 -> +0.4127 ABPC at n=100). The keyword overrides exist for
     the runner's --vit-softmax / --vit-bilinear ablation."""
-    from autolrp import LRPConfig
-    return LRPConfig(
-        rule=make_rule(gamma_linear=mm_gamma, conv_gamma=conv_gamma,
-                       bilinear=bilinear),
-        softmax=softmax,
-        layernorm='passthrough',
-        activation='passthrough',
-    )
+    from autolrp import LRPConfig, on, SOFTMAX_NODES, LAYERNORM_NODES
+    return LRPConfig(rule={**make_rule(gamma_linear=mm_gamma, conv_gamma=conv_gamma,
+                                       bilinear=bilinear),
+                           **on(SOFTMAX_NODES, softmax),
+                           **on(LAYERNORM_NODES, 'passthrough')})

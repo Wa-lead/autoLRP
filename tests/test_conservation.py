@@ -4,7 +4,7 @@ The engine seeds the selected scalar with +1 (engine._unit_seed), so the
 conservation target is Σ R_input ≈ +1 REGARDLESS of the logit's sign —
 seed 43 of the old sign-based invariant gave argmax logit −0.0308 with
 Σ R = +1.000000 exactly, err 2.0, a false failure. Dissipation away
-from +1 comes from bias absorption (run_linear_rule's bias split),
+from +1 comes from bias absorption (the matmul hook's bias split),
 softmax/LN handling, and the α/β and γ decompositions.
 
 Every cell seeds its OWN rng stream (crc32 of "rule/arch"), so cells are
@@ -100,22 +100,19 @@ _ARCHS = [
 ]
 
 _RULES = [
-    ('epsilon',    LRPConfig(rule=on_linear('epsilon'), activation='passthrough')),
-    ('zplus',      LRPConfig(rule=on_linear('zplus'),   activation='passthrough')),
-    ('alpha_beta', LRPConfig(rule=on_linear(('alpha_beta', {'alpha': 2.0, 'beta': 1.0})),
-                             activation='passthrough')),
-    ('gamma',      LRPConfig(rule=on_linear(('gamma', {'gamma': 0.25})),
-                             activation='passthrough')),
+    ('epsilon',    LRPConfig(rule=on_linear('epsilon'))),
+    ('zplus',      LRPConfig(rule=on_linear('zplus'))),
+    ('alpha_beta', LRPConfig(rule=on_linear(('alpha_beta', {'alpha': 2.0, 'beta': 1.0})))),
+    ('gamma',      LRPConfig(rule=on_linear(('gamma', {'gamma': 0.25})))),
     ('composite',  LRPConfig(
-        rule={**BASE, 'ConvolutionBackward': 'zplus'},
-        activation='passthrough')),
+        rule={**BASE, 'ConvolutionBackward': 'zplus'})),
 ]
 
 # |Σ R_input − 1| tolerance per (rule, arch), against the +1 unit seed.
 # Calibrated: measured error at the per-cell crc32 seeds on torch 2.13
 # fp32, × 1.5, + 0.02, floor 0.05. Bias-free cells measured 0.0000, so
 # their 0.05 asserts exact conservation; biased cells measured 0.61–0.99
-# (bias shares discarded by run_linear_rule's bias split).
+# (bias shares discarded by the matmul hook's bias split).
 _TOLS = {
     'epsilon':    {'mlp_nobias': 0.05, 'mlp_bias': 1.31,
                    'cnn_nobias': 0.05, 'cnn_bias': 1.51,
@@ -182,7 +179,7 @@ def test_depth_does_not_degrade(depth):
     model = nn.Sequential(*layers).eval()
     data = torch.randn(1, 8)
     r_sum, _logit = _run(
-        model, data, LRPConfig(rule=on_linear('epsilon'), activation='passthrough'))
+        model, data, LRPConfig(rule=on_linear('epsilon')))
     assert abs(r_sum - 1.0) < 0.5
 
 
@@ -191,7 +188,7 @@ def test_depth_does_not_degrade(depth):
 # ---------------------------------------------------------------------------
 
 class TestTargetVariants:
-    _CFG = LRPConfig(rule=on_linear('epsilon'), activation='passthrough')
+    _CFG = LRPConfig(rule=on_linear('epsilon'))
 
     def _setup(self):
         return _mlp(8, 16, 4, bias=False), torch.randn(1, 8)

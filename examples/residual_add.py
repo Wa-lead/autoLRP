@@ -24,10 +24,10 @@ import torch
 import torch.nn as nn
 
 import autolrp
-from autolrp import BASE, LRPConfig, metrics
+from autolrp import BASE, LRPConfig, metrics, CPLRP
 from autolrp.backward import analysis
 from autolrp.backward.analysis import register_analyzer
-from autolrp.backward.graph import is_input_leaf, is_leaf, node_facts, parents, topo_order
+from autolrp.backward.graph import is_input, is_leaf, node_facts, parents, topo_order
 
 
 # ---------------------------------------------------------------------------
@@ -39,31 +39,27 @@ def _subgraph(node):
 
 
 def _weight_leaf(node):
-    return is_leaf(node) and not is_input_leaf(node)
+    return is_leaf(node) and not is_input(node)
 
 
 @register_analyzer('residual_add')
-def residual_add(nodes):
-    """``{add_node: skip_slot}`` for every add/sub that merges two paths
-    from one tensor."""
-    out = {}
-    for n in nodes:
-        if not any(k in n.name() for k in ('AddBackward', 'SubBackward')):
-            continue
-        p = parents(n)                                   # real producers, aliases collapsed
-        if len(p) < 2 or p[0] is None or p[1] is None:   # a constant operand: not a merge
-            continue
-        sub = [_subgraph(p[0]), _subgraph(p[1])]
-        shared = [m for i, m in sub[0].items() if i in sub[1] and not _weight_leaf(m)]
-        if not shared:                                   # only weights in common: not a merge
-            continue
-        if id(p[0]) in sub[1]:
-            out[n] = 0                                   # a + F(a)
-        elif id(p[1]) in sub[0]:
-            out[n] = 1                                   # F(a) + a
-        else:
-            out[n] = 0 if len(sub[0]) <= len(sub[1]) else 1   # G(a) + F(a): shortcut = shorter path
-    return out
+def residual_add(node):
+    """The skip slot of an add/sub that merges two paths from one tensor,
+    ``None`` for any other node."""
+    if not any(k in node.name() for k in ('AddBackward', 'SubBackward')):
+        return None
+    p = parents(node)                                    # real producers, aliases collapsed
+    if len(p) < 2 or p[0] is None or p[1] is None:       # a constant operand: not a merge
+        return None
+    sub = [_subgraph(p[0]), _subgraph(p[1])]
+    shared = [m for i, m in sub[0].items() if i in sub[1] and not _weight_leaf(m)]
+    if not shared:                                       # only weights in common: not a merge
+        return None
+    if id(p[0]) in sub[1]:
+        return 0                                         # a + F(a)
+    if id(p[1]) in sub[0]:
+        return 1                                         # F(a) + a
+    return 0 if len(sub[0]) <= len(sub[1]) else 1        # G(a) + F(a): shortcut = shorter path
 
 
 # ---------------------------------------------------------------------------
@@ -162,12 +158,12 @@ def transformer_experiment():
     print(f"\n4-layer bias-free TransformerEncoder with a causal mask (random weights): "
           f"{len(facts)} add nodes, {tagged} tagged residual; the other {len(facts) - tagged} "
           f"add the mask (a constant slot)")
-    for attn_label, kw in [("epsilon attention (BASE): relevance flows through the scores", {}),
-                           ("attn='cplrp': attention weights detached, the scores get none", {'attn': 'cplrp'})]:
+    for attn_label, frag in [("epsilon attention (BASE): relevance flows through the scores", {}),
+                             ("CPLRP: attention weights detached, the scores get none", CPLRP)]:
         print(f"  {attn_label}")
         for name, cfg in CONFIGS.items():
             x = autolrp.tensor(data.clone())
-            score(x).lrp(config=LRPConfig(rule=cfg.rule, **kw))
+            score(x).lrp(config=LRPConfig(rule={**cfg.rule, **frag}))
             print(f"    {name:26s} conservation {metrics.conservation(x):6.3f}")
     print("  (random weights: only conservation is meaningful here)")
 

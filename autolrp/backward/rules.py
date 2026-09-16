@@ -1,16 +1,14 @@
 r"""LRP rules: every function that turns a node's output relevance into
 its input relevance, one table per kind of node.
 
-Two-operand nodes, ``rule(a, b, R_out, eps, fwd, bwd_a, bwd_b, **params)
--> (R_a, R_b)``. ``fwd(a, b)`` is the op without bias, ``bwd_a(b, s)``
+Two-operand nodes, ``rule(a, b, R_out, eps, fwd, bwd_a, bwd_b, *,
+attribute, **params) -> (R_a, R_b)``, ``None`` for an operand the rule
+does not attribute. ``fwd(a, b)`` is the op without bias, ``bwd_a(b, s)``
 its VJP into ``a`` for an output-shaped ``s``, ``bwd_b(a, s)`` its VJP
-into ``b``; the linear family names them ``x``, ``w``, ``bwd_x``,
-``bwd_w``. Contribution rules (linear, bilinear) use the kernels,
-``s = R / z`` then ``a * bwd_a(b, s)``; split rules (mul, div, add, sub)
-work on operands that share ``z``'s shape and ignore the kernels. The
-linear rules return ``(R_x, None)``: the weight slot keeps its native
-gradient. ``fwd`` arrives memoized from ``run_linear_rule``, so calling
-``fwd(x, w)`` for ``z`` costs nothing more.
+into ``b``. Product rules use the kernels, ``s = R / z`` then
+``a * bwd_a(b, s)``; split rules (mul, div, add, sub) work on operands
+that share ``z``'s shape and are called without kernels. ``fwd`` arrives memoized
+from the hook, so calling ``fwd(a, b)`` for ``z`` costs nothing more.
 
 One-operand nodes, ``rule(x, y, R_out, eps, **saved) -> R_in``. ``x`` is
 the node's input, ``y`` its output (``None`` when the node did not keep
@@ -18,10 +16,21 @@ it), ``saved`` the rest of what the node saved: ``dim`` for a softmax,
 ``normalized_shape``, ``weight``, ``bias``, ``mean``, ``rstd`` for a
 layer norm, ``dim`` and ``keepdim`` for a reduction.
 
-Names are positional: ``detach_lhs`` zeros the operand written on the
-left of that op, always. Which operand a config means is decided
-before the call, by the ``('detach', {'by': <fact>})`` entry.
+``attribute`` is ``'lhs'`` (the first operand, the second its weight),
+``'rhs'``, or ``'both'`` (each with half the relevance, the Euler budget
+of a bilinear product); a split rule attributing one side gives it the
+whole of ``R``. Each rule's signature carries its own default, ``'lhs'``
+for the product rules, ``'both'`` for the split rules. The entry may set
+it; the node's facts may (:mod:`autolrp.backward.resolve`); otherwise the
+rule's default stands.
+
+One route from a node to its rule: the node's name without its version
+digit selects a :class:`RuleTable` in :data:`RULES_FOR`; the config's
+``rule`` entry for that node names one function in the table. Every
+node that runs a rule is a key of :data:`RULES_FOR`, and the keys are
+exactly the node names a config may use.
 """
+import inspect
 import warnings
 from typing import Callable, Dict
 
@@ -29,18 +38,22 @@ import torch
 import torch.nn.functional as F
 
 from .lrp_utils import stabilize, apply_bias_split
+from ..nodes import (PRODUCT_NODES, MUL_NODES, ADD_NODES, SOFTMAX_NODES,
+                     LAYERNORM_NODES, REDUCTION_NODES, CUMSUM_NODES, ELEMENTWISE_NODES)
 
 
-class Family(dict):
-    """A rule table plus the one name it falls back to when a
-    ``('detach', {'by': <fact>})`` entry addresses a node that does not
-    carry that fact."""
+class RuleTable(dict):
+    """``{rule name: function}`` for one kind of node. ``default`` is the
+    ``BASE`` entry for its nodes, and what a ``detach`` entry runs on the
+    kept operand. ``two_operand`` is read off the rules: they take
+    ``attribute``."""
 
     def __init__(self, default: str, entries: Dict[str, Callable]):
         super().__init__(entries)
         if default not in entries:
-            raise ValueError(f"family default {default!r} is not in the table")
+            raise ValueError(f"table default {default!r} is not in the table")
         self.default = default
+        self.two_operand = all('attribute' in inspect.signature(f).parameters for f in entries.values())
 
 
 _GAMMA_DEGENERATION_WARNED: set = set()
@@ -61,30 +74,48 @@ def _warn_gamma_degeneration(gamma_val, fn_name):
 
 
 # ---------------------------------------------------------------------------
-# Linear family: addmm, mm, convolution, and any product with one
-# operand from the input
+# Product rules: addmm, mm, bmm, convolution
 # ---------------------------------------------------------------------------
 
-def epsilon(x, w, R_out, eps, fwd, bwd_x, bwd_w):
-    r"""LRP-epsilon (Bach et al. 2015, 2): ``R_in = x * bwd_x(w, R / z)``."""
-    z = fwd(x, w)
+def _sides(attribute, R_out):
+    r"""Which operands a product rule attributes, and the relevance each
+    gets: ``'lhs'`` the first with all of it, ``'rhs'`` the second,
+    ``'both'`` both with half each (the Euler budget of a bilinear
+    product). Returns ``(attribute a, attribute b, R)``."""
+    if attribute == 'lhs':
+        return True, False, R_out
+    if attribute == 'rhs':
+        return False, True, R_out
+    if attribute == 'both':
+        return True, True, R_out * 0.5
+    raise ValueError(f"attribute must be 'lhs', 'rhs' or 'both', got {attribute!r}")
+
+
+def epsilon(a, b, R_out, eps, fwd, bwd_a, bwd_b, *, attribute='lhs'):
+    r"""LRP-epsilon (Bach et al. 2015, 2): ``R_a = a * bwd_a(b, R / z)``,
+    and the same for ``b`` with ``a`` as its weight."""
+    do_a, do_b, R = _sides(attribute, R_out)
+    z = fwd(a, b)
     with torch.no_grad():
-        return x * bwd_x(w, R_out / stabilize(z, eps)), None
+        s = R / stabilize(z, eps)
+        return (a * bwd_a(b, s) if do_a else None,
+                b * bwd_b(a, s) if do_b else None)
 
 
-def zplus(x, w, R_out, eps, fwd, bwd_x, bwd_w):
+def zplus(a, b, R_out, eps, fwd, bwd_a, bwd_b, *, attribute='lhs'):
     r"""LRP-z+ (Bach et al. 2015): positive contributions only, the
     alpha-beta rule with ``alpha = 1``, ``beta = 0``."""
+    do_a, do_b, R = _sides(attribute, R_out)
     with torch.no_grad():
-        x_pos, x_neg = x.clamp(min=0), x.clamp(max=0)
-        w_pos, w_neg = w.clamp(min=0), w.clamp(max=0)
-        z_pos = fwd(x_pos, w_pos) + fwd(x_neg, w_neg)
-        s_pos = R_out / stabilize(z_pos, eps)
-        return (x_pos * bwd_x(w_pos, s_pos)
-                + x_neg * bwd_x(w_neg, s_pos)), None
+        a_pos, a_neg = a.clamp(min=0), a.clamp(max=0)
+        b_pos, b_neg = b.clamp(min=0), b.clamp(max=0)
+        z_pos = fwd(a_pos, b_pos) + fwd(a_neg, b_neg)
+        s_pos = R / stabilize(z_pos, eps)
+        return ((a_pos * bwd_a(b_pos, s_pos) + a_neg * bwd_a(b_neg, s_pos)) if do_a else None,
+                (b_pos * bwd_b(a_pos, s_pos) + b_neg * bwd_b(a_neg, s_pos)) if do_b else None)
 
 
-def alpha_beta(x, w, R_out, eps, fwd, bwd_x, bwd_w, *, alpha, beta):
+def alpha_beta(a, b, R_out, eps, fwd, bwd_a, bwd_b, *, alpha, beta, attribute='lhs'):
     r"""LRP-alpha-beta (Bach et al. 2015, 2.2): positive contributions
     scaled by ``alpha``, negative by ``-beta``, with ``alpha - beta = 1``
     (``ValueError`` otherwise)."""
@@ -92,129 +123,142 @@ def alpha_beta(x, w, R_out, eps, fwd, bwd_x, bwd_w, *, alpha, beta):
         raise ValueError(
             f"alpha_beta requires alpha - beta == 1, got "
             f"alpha={alpha}, beta={beta} (diff={alpha - beta})")
-    x_pos, x_neg = x.clamp(min=0), x.clamp(max=0)
-    w_pos, w_neg = w.clamp(min=0), w.clamp(max=0)
-    z_pos = fwd(x_pos, w_pos) + fwd(x_neg, w_neg)
-    s_pos = alpha * R_out / stabilize(z_pos, eps)
-    R_in = (x_pos * bwd_x(w_pos, s_pos)
-            + x_neg * bwd_x(w_neg, s_pos))
+    do_a, do_b, R = _sides(attribute, R_out)
+    a_pos, a_neg = a.clamp(min=0), a.clamp(max=0)
+    b_pos, b_neg = b.clamp(min=0), b.clamp(max=0)
+    z_pos = fwd(a_pos, b_pos) + fwd(a_neg, b_neg)
+    s_pos = alpha * R / stabilize(z_pos, eps)
+    R_a = (a_pos * bwd_a(b_pos, s_pos) + a_neg * bwd_a(b_neg, s_pos)) if do_a else None
+    R_b = (b_pos * bwd_b(a_pos, s_pos) + b_neg * bwd_b(a_neg, s_pos)) if do_b else None
     if beta != 0:
-        z_neg = fwd(x_pos, w_neg) + fwd(x_neg, w_pos)
-        s_neg = -beta * R_out / stabilize(z_neg, eps)
-        R_in = R_in + (x_pos * bwd_x(w_neg, s_neg)
-                       + x_neg * bwd_x(w_pos, s_neg))
-    return R_in, None
+        z_neg = fwd(a_pos, b_neg) + fwd(a_neg, b_pos)
+        s_neg = -beta * R / stabilize(z_neg, eps)
+        if do_a:
+            R_a = R_a + (a_pos * bwd_a(b_neg, s_neg) + a_neg * bwd_a(b_pos, s_neg))
+        if do_b:
+            R_b = R_b + (b_pos * bwd_b(a_neg, s_neg) + b_neg * bwd_b(a_pos, s_neg))
+    return R_a, R_b
 
 
-def gamma(x, w, R_out, eps, fwd, bwd_x, bwd_w, *, gamma):
-    r"""LRP-gamma, sign-symmetric: both ``x`` and ``w`` are split by sign
-    and same-sign paths are amplified by ``gamma``, so mixed-sign inputs
-    are handled; equals :func:`gamma_montavon` when ``x >= 0``.
+def gamma(a, b, R_out, eps, fwd, bwd_a, bwd_b, *, gamma, attribute='lhs'):
+    r"""LRP-gamma, sign-symmetric: the attributed operand is split by sign
+    and the other, its weight, has its same-sign paths amplified by
+    ``gamma``, so mixed-sign inputs are handled; equals
+    :func:`gamma_montavon` when the attributed operand is ``>= 0``.
     Degenerates to :func:`epsilon` for ``gamma <= 0.01`` (warns once)."""
     if gamma <= 0.01:
         _warn_gamma_degeneration(gamma, 'gamma')
-        return epsilon(x, w, R_out, eps, fwd, bwd_x, bwd_w)
-    z = fwd(x, w)
+        return epsilon(a, b, R_out, eps, fwd, bwd_a, bwd_b, attribute=attribute)
+    do_a, do_b, R = _sides(attribute, R_out)
+    z = fwd(a, b)
     with torch.no_grad():
-        x_pos, x_neg = x.clamp(min=0), x.clamp(max=0)
-        w_pos = w + gamma * w.clamp(min=0)
-        w_neg = w + gamma * w.clamp(max=0)
-        z_pp = fwd(x_pos, w_pos) + fwd(x_neg, w_neg)
-        z_pn = fwd(x_pos, w_neg) + fwd(x_neg, w_pos)
-        s_pos = (z > 0).to(z.dtype) * R_out / stabilize(z_pp, eps)
-        s_neg = (z < 0).to(z.dtype) * R_out / stabilize(z_pn, eps)
-        return (x_pos * (bwd_x(w_pos, s_pos) + bwd_x(w_neg, s_neg))
-                + x_neg * (bwd_x(w_neg, s_pos) + bwd_x(w_pos, s_neg))), None
+        R_a = R_b = None
+        if do_a:
+            x_pos, x_neg = a.clamp(min=0), a.clamp(max=0)
+            w_pos, w_neg = b + gamma * b.clamp(min=0), b + gamma * b.clamp(max=0)
+            z_pp = fwd(x_pos, w_pos) + fwd(x_neg, w_neg)
+            z_pn = fwd(x_pos, w_neg) + fwd(x_neg, w_pos)
+            s_pos = (z > 0).to(z.dtype) * R / stabilize(z_pp, eps)
+            s_neg = (z < 0).to(z.dtype) * R / stabilize(z_pn, eps)
+            R_a = (x_pos * (bwd_a(w_pos, s_pos) + bwd_a(w_neg, s_neg))
+                   + x_neg * (bwd_a(w_neg, s_pos) + bwd_a(w_pos, s_neg)))
+        if do_b:
+            x_pos, x_neg = b.clamp(min=0), b.clamp(max=0)
+            w_pos, w_neg = a + gamma * a.clamp(min=0), a + gamma * a.clamp(max=0)
+            z_pp = fwd(w_pos, x_pos) + fwd(w_neg, x_neg)
+            z_pn = fwd(w_neg, x_pos) + fwd(w_pos, x_neg)
+            s_pos = (z > 0).to(z.dtype) * R / stabilize(z_pp, eps)
+            s_neg = (z < 0).to(z.dtype) * R / stabilize(z_pn, eps)
+            R_b = (x_pos * (bwd_b(w_pos, s_pos) + bwd_b(w_neg, s_neg))
+                   + x_neg * (bwd_b(w_neg, s_pos) + bwd_b(w_pos, s_neg)))
+        return R_a, R_b
 
 
-def gamma_montavon(x, w, R_out, eps, fwd, bwd_x, bwd_w, *, gamma):
+def gamma_montavon(a, b, R_out, eps, fwd, bwd_a, bwd_b, *, gamma, attribute='lhs'):
     r"""LRP-gamma as in Montavon et al. 2019 (10.2.3) and zennit:
     ``w' = w + gamma * w+``, then the epsilon rule with ``w'``. Assumes
-    ``x >= 0``; on mixed-sign inputs it amplifies positive-weight paths
-    whatever the contribution sign, see :func:`gamma`."""
+    the attributed operand ``>= 0``; on mixed-sign inputs it amplifies
+    positive-weight paths whatever the contribution sign, see
+    :func:`gamma`."""
     if gamma <= 0.01:
         _warn_gamma_degeneration(gamma, 'gamma_montavon')
-        return epsilon(x, w, R_out, eps, fwd, bwd_x, bwd_w)
+        return epsilon(a, b, R_out, eps, fwd, bwd_a, bwd_b, attribute=attribute)
+    do_a, do_b, R = _sides(attribute, R_out)
     with torch.no_grad():
-        w_prime = w + gamma * w.clamp(min=0)
-        s = R_out / stabilize(fwd(x, w_prime), eps)
-        return x * bwd_x(w_prime, s), None
+        R_a = R_b = None
+        if do_a:
+            w = b + gamma * b.clamp(min=0)
+            R_a = a * bwd_a(w, R / stabilize(fwd(a, w), eps))
+        if do_b:
+            w = a + gamma * a.clamp(min=0)
+            R_b = b * bwd_b(w, R / stabilize(fwd(w, b), eps))
+        return R_a, R_b
 
 
-def zbox(x, w, R_out, eps, fwd, bwd_x, bwd_w, *, low, high):
+def zbox(a, b, R_out, eps, fwd, bwd_a, bwd_b, *, low, high, attribute='lhs'):
     r"""z-box rule for a bounded input domain ``[low, high]`` (Montavon
     et al. 2017, 3.1), meant for the input layer, e.g. normalized
-    pixels."""
-    z = fwd(x, w)
+    pixels; the bounds are the first operand's, so it attributes that
+    one only."""
+    if attribute != 'lhs':
+        raise ValueError("zbox bounds the first operand: attribute must be 'lhs'")
+    z = fwd(a, b)
     with torch.no_grad():
-        L = torch.full_like(x, low)
-        H = torch.full_like(x, high)
-        w_pos, w_neg = w.clamp(min=0), w.clamp(max=0)
-        s = R_out / stabilize(z - fwd(L, w_pos) - fwd(H, w_neg), eps)
-        return (x * bwd_x(w, s)
-                - L * bwd_x(w_pos, s)
-                - H * bwd_x(w_neg, s)), None
+        L = torch.full_like(a, low)
+        H = torch.full_like(a, high)
+        b_pos, b_neg = b.clamp(min=0), b.clamp(max=0)
+        s = R_out / stabilize(z - fwd(L, b_pos) - fwd(H, b_neg), eps)
+        return (a * bwd_a(b, s) - L * bwd_a(b_pos, s) - H * bwd_a(b_neg, s)), None
+
+
+def gradient_input(a, b, R_out, eps, fwd, bwd_a, bwd_b, *, attribute='lhs'):
+    r"""Gradient times input, ``a * bwd_a(b, R)``: no ``z`` in the
+    denominator, so it does not conserve. Attributed ``'both'`` ways on a
+    bilinear product it is LXT's uniform attention rule."""
+    do_a, do_b, R = _sides(attribute, R_out)
+    return (a * bwd_a(b, R) if do_a else None,
+            b * bwd_b(a, R) if do_b else None)
 
 
 # ---------------------------------------------------------------------------
-# Bilinear family: a product with both operands from the input
+# Split rules: mul, div, add, sub (operands share z's shape). Attributing
+# one side gives it the whole of R; 'both' splits.
 # ---------------------------------------------------------------------------
 
-def epsilon_bmm(a, b, R_out, eps, fwd, bwd_a, bwd_b):
-    r"""Both operands receive the epsilon share, out of a ``2z`` budget
-    (bilinear epsilon, AttnLRP Prop. 3.3)."""
-    s = R_out / stabilize(2.0 * fwd(a, b), eps)
-    return a * bwd_a(b, s), b * bwd_b(a, s)
+def _split(attribute, R_out, both, a, b):
+    """``(R_a, R_b)``: one attributed side takes all of ``R_out``; both
+    take the split ``both()`` computes, which needs both operands saved."""
+    if attribute == 'lhs':
+        return R_out, None
+    if attribute == 'rhs':
+        return None, R_out
+    if attribute == 'both':
+        if a is None or b is None:
+            raise ValueError("attribute='both' on an operand the node did not save: "
+                             "the other operand is a constant or a frozen tensor")
+        return both()
+    raise ValueError(f"attribute must be 'lhs', 'rhs' or 'both', got {attribute!r}")
 
 
-def uniform_bmm(a, b, R_out, eps, fwd, bwd_a, bwd_b):
-    r"""Gradient times input, halved, on each operand (LXT uniform)."""
-    return a * bwd_a(b, R_out) / 2.0, b * bwd_b(a, R_out) / 2.0
+def proportional(a, b, R_out, eps, *_, attribute='both'):
+    r"""Split ``R_out`` between two operands in proportion to their
+    magnitudes."""
+    def both():
+        with torch.no_grad():
+            aa, bb = a.abs(), b.abs()
+            d = aa + bb + eps
+            return (aa / d) * R_out, (bb / d) * R_out
+    return _split(attribute, R_out, both, a, b)
 
 
-def detach_lhs_bmm(a, b, R_out, eps, fwd, bwd_a, bwd_b):
-    r"""Zeros for the first operand; the second takes the full epsilon
-    share."""
-    s = R_out / stabilize(fwd(a, b), eps)
-    return torch.zeros_like(a), b * bwd_b(a, s)
+def equal(a, b, R_out, eps, *_, attribute='both'):
+    r"""Half of ``R_out`` to each operand."""
+    return _split(attribute, R_out, lambda: (R_out * 0.5, R_out * 0.5), a, b)
 
 
-def detach_rhs_bmm(a, b, R_out, eps, fwd, bwd_a, bwd_b):
-    r"""Zeros for the second operand; the first takes the full epsilon
-    share."""
-    s = R_out / stabilize(fwd(a, b), eps)
-    return a * bwd_a(b, s), torch.zeros_like(b)
-
-
-# ---------------------------------------------------------------------------
-# Split rules: mul, div, add, sub (operands share z's shape)
-# ---------------------------------------------------------------------------
-
-def proportional(a, b, R_out, eps, *_):
-    r"""Split by magnitude, ``|a| / (|a| + |b|)`` to the first operand."""
-    aa, bb = a.abs(), b.abs()
-    d = aa + bb + eps
-    return (aa / d) * R_out, (bb / d) * R_out
-
-
-def detach_lhs(a, b, R_out, eps, *_):
-    r"""Zeros to the first operand, all relevance to the second."""
-    return torch.zeros_like(R_out), R_out
-
-
-def detach_rhs(a, b, R_out, eps, *_):
-    r"""All relevance to the first operand, zeros to the second."""
-    return R_out, torch.zeros_like(R_out)
-
-
-def equal(a, b, R_out, eps, *_):
-    r"""``R / 2`` to each operand (Otsuki et al. 2024; for ResNets)."""
-    return 0.5 * R_out, 0.5 * R_out
-
-
-def fixed(a, b, R_out, eps, *_, p):
+def fixed(a, b, R_out, eps, *_, p, attribute='both'):
     r"""``p * R`` to the first operand, ``(1 - p) * R`` to the second."""
-    return p * R_out, (1.0 - p) * R_out
+    return _split(attribute, R_out, lambda: (p * R_out, (1.0 - p) * R_out), a, b)
 
 
 # ---------------------------------------------------------------------------
@@ -226,9 +270,10 @@ def passthrough(x, y, R_out, eps, **_):
     return R_out
 
 
-def activation_yx(x, y, R_out, eps, **_):
-    r"""``y/x`` rule for a nonlinearity (Achtibat et al. 2024, Prop. 3.2):
-    ``R_in = R_out * y / x``."""
+def elementwise_yx(x, y, R_out, eps, **_):
+    r"""``y/x`` rule for an elementwise nonlinearity (Achtibat et al. 2024,
+    Prop. 3.2): ``R_in = R_out * y / x``. Stated there for any elementwise
+    nonlinearity, so it applies to ``exp`` and ``sqrt`` as to ``gelu``."""
     return R_out * y / stabilize(x, eps)
 
 
@@ -240,7 +285,7 @@ def softmax_jacobian(x, y, R_out, eps, *, dim=-1, **_):
     return x * (R_out - y * R_out.sum(dim=dim, keepdim=True))
 
 
-def softmax_detach(x, y, R_out, eps, **_):
+def softmax_gate(x, y, R_out, eps, **_):
     r"""The softmax output as a constant gate: ``R_in = y * R_out``. Not
     conservative; sharpens attention maps in some recipes."""
     return y * R_out
@@ -293,8 +338,8 @@ def layernorm_detach_std(x, y, R_out, eps, *, normalized_shape, weight=None,
         dims = tuple(range(-len(normalized_shape), 0))
         xn = _normalized(x, normalized_shape, eps, mean, rstd)
         y_nb = xn * weight if weight is not None else xn
-        R = apply_bias_split(R_out, y_nb, bias, eps)            # + bias: its share leaves
-        m = x.mean(dim=dims, keepdim=True).expand_as(x)          # * weight and / std: pass through
+        R = apply_bias_split(R_out, y_nb, bias, eps)            # since z = y_nb + bias we first remove bias share, not here it is the R share or xn
+        m = x.mean(dim=dims, keepdim=True).expand_as(x)          # xn = x - mean(x), so we first need compute the relevance for both brnahces and move the mean() relevance to x
         R_x, R_m = proportional(x, m, R, eps)                    # x - mean(x): a two-operand sub
         R_via_mean = reduction_proportional(                     # mean(x): its share back over x
             x, None, R_m.sum(dim=dims, keepdim=True), eps, dim=dims, keepdim=True)
@@ -304,12 +349,18 @@ def layernorm_detach_std(x, y, R_out, eps, *, normalized_shape, weight=None,
 def reduction_proportional(x, y, R_out, eps, *, dim=None, keepdim=False, **_):
     r"""A reduction (mean, sum, norm): each reduced element takes the
     share ``|x_i| / sum |x|`` of the output it was reduced into. ``dim``
-    is ``None`` for a full reduction or a tuple of ints."""
+    as the op received it: ``None`` or an empty tuple for a full
+    reduction, an int, or a tuple of ints."""
+    if isinstance(dim, int):
+        dim = (dim,)
+    elif dim is not None and len(dim) == 0:
+        dim = None
     with torch.no_grad():
         ax = x.abs()
         if dim is None:
             return ax / (ax.sum() + eps) * R_out
-        dims = tuple(d if d < x.ndim else d - (1 << 64) for d in dim)
+        # a native node stores a negative dim as an unsigned 64-bit value
+        dims = tuple((d - (1 << 64) if d >= (1 << 63) else d) % x.ndim for d in dim)
         ratios = ax / (ax.sum(dim=dims, keepdim=True) + eps)
         if not keepdim:
             shape = list(x.shape)
@@ -323,70 +374,81 @@ def reduction_proportional(x, y, R_out, eps, *, dim=None, keepdim=False, **_):
 # Rule tables
 # ---------------------------------------------------------------------------
 
-LINEAR_RULES = Family('epsilon', {
-    'epsilon':        epsilon,
-    'zplus':          zplus,
-    'gamma':          gamma,
-    'gamma_montavon': gamma_montavon,
-    'alpha_beta':     alpha_beta,
-    'zbox':           zbox,
+def cumsum_epsilon(x, y, R_out, eps, *, dim, **_):
+    r"""``cumsum``: a linear map with 0/1 weights, ``y_j = sum_{i<=j} x_i``.
+    The epsilon rule gives ``R_i = x_i * sum_{j>=i} R_j / y_j``, a reversed
+    cumulative sum of ``R / y``; the native gradient would hand every
+    ``x_i`` the full ``R_j`` of each later output."""
+    if y is None:
+        y = torch.cumsum(x, dim)
+    s = R_out / stabilize(y, eps)
+    return x * torch.flip(torch.cumsum(torch.flip(s, (dim,)), dim), (dim,))
+
+
+# Every product kind (addmm, mm, bmm, convolution). A rule attributes an
+# operand with the other as its weight; ``attribute`` says which, or
+# both with half the relevance each.
+PRODUCT_RULES = RuleTable('epsilon', {
+    'epsilon':          epsilon,
+    'zplus':            zplus,
+    'gamma':            gamma,
+    'gamma_montavon':   gamma_montavon,
+    'alpha_beta':       alpha_beta,
+    'zbox':             zbox,
+    'gradient_input':   gradient_input,
 })
 
-BMM_RULES = Family('epsilon', {
-    'epsilon':     epsilon_bmm,
-    'uniform':     uniform_bmm,
-    'detach_lhs':  detach_lhs_bmm,
-    'detach_rhs':  detach_rhs_bmm,
-})
-
-MUL_RULES = Family('proportional', {
+MUL_RULES = RuleTable('proportional', {
     'proportional': proportional,
-    'detach_lhs':   detach_lhs,
-    'detach_rhs':   detach_rhs,
 })
 
-ADD_RULES = Family('proportional', {
+ADD_RULES = RuleTable('proportional', {
     'proportional': proportional,
     'equal':        equal,
     'fixed':        fixed,
-    'detach_lhs':   detach_lhs,
-    'detach_rhs':   detach_rhs,
 })
 
-SOFTMAX_RULES = Family('passthrough', {
+SOFTMAX_RULES = RuleTable('passthrough', {
     'passthrough': passthrough,
     'jacobian':    softmax_jacobian,
-    'detach':      softmax_detach,
+    'gate':        softmax_gate,
 })
 
-LAYERNORM_RULES = Family('identity', {
+LAYERNORM_RULES = RuleTable('identity', {
     'identity':    layernorm_identity,
     'passthrough': passthrough,
     'yx':          layernorm_yx,
     'detach_std':  layernorm_detach_std,
 })
 
-ACTIVATION_RULES = Family('passthrough', {
+ELEMENTWISE_RULES = RuleTable('passthrough', {
     'passthrough': passthrough,
-    'yx':          activation_yx,
+    'yx':          elementwise_yx,
 })
 
-REDUCTION_RULES = Family('proportional', {
+REDUCTION_RULES = RuleTable('proportional', {
     'proportional': reduction_proportional,
 })
 
-# The one virtual name, resolved per node to detach_lhs/detach_rhs from
-# the slot fact named by its required by= kwarg.
+CUMSUM_RULES = RuleTable('epsilon', {
+    'epsilon': cumsum_epsilon,
+})
+
+# The one virtual name: ``('detach', {'by': fact})`` on a two-operand
+# table runs the table's default (``rule=`` to choose another) attributing
+# the operand the fact does not name; on a node without the fact, the
+# default with the graph's own attribute.
 VIRTUAL_RULES = frozenset({'detach'})
 
-# Node name (no version digit) to table; these are the config keys.
-FAMILIES: Dict[str, Family] = {
-    'AddmmBackward':       LINEAR_RULES,
-    'MmBackward':          LINEAR_RULES,
-    'ConvolutionBackward': LINEAR_RULES,
-    'BmmBackward':         BMM_RULES,
-    'MulBackward':         MUL_RULES,
-    'DivBackward':         MUL_RULES,
-    'AddBackward':         ADD_RULES,
-    'SubBackward':         ADD_RULES,
+# Node name (no version digit) to its rule table: the one map behind
+# resolution, validation and ``BASE``. The names live in ``autolrp.nodes``.
+RULES_FOR: Dict[str, RuleTable] = {
+    **{name: PRODUCT_RULES for name in PRODUCT_NODES},
+    **{name: MUL_RULES for name in MUL_NODES},
+    **{name: ADD_RULES for name in ADD_NODES},
+    **{name: SOFTMAX_RULES for name in SOFTMAX_NODES},
+    **{name: LAYERNORM_RULES for name in LAYERNORM_NODES},
+    **{name: ELEMENTWISE_RULES for name in ELEMENTWISE_NODES},
+    **{name: REDUCTION_RULES for name in REDUCTION_NODES},
+    **{name: CUMSUM_RULES for name in CUMSUM_NODES},
 }

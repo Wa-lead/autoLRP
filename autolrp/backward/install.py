@@ -6,22 +6,22 @@ routing (shape ops, selections) or the node saved nothing.
 """
 
 import torch
-import torch.nn.functional as F
 
 from . import lrp_utils
 from .lrp_utils import (
-    run_linear_rule,
     stabilize,
     conv_ops,
     conv_transposed_ops,
+    mm_ops,
+    reduce_to_shape,
     apply_bias_split,
+    topk_filter,
+    cache_pair,
 )
-from .rules import (LINEAR_RULES, MUL_RULES, BMM_RULES, ADD_RULES,
-                    SOFTMAX_RULES, LAYERNORM_RULES, ACTIVATION_RULES,
-                    REDUCTION_RULES)
 from .rules import passthrough as _rules_passthrough
-from .graph import node_facts, parents, reaches_input, find_bias, live_slots, input_slots
-from .resolve import resolve, resolve_rule, _trace
+from ..nodes import saved_tensors
+from .graph import node_facts, parents, reaches_input, find_bias
+from .resolve import resolve, _trace
 
 
 _MISSING_LINEAR_STATE = (
@@ -30,8 +30,8 @@ _MISSING_LINEAR_STATE = (
 # ---- helpers ---------------------------------------------------------
 
 def _match_dtype(returned: tuple, original_gi: tuple) -> tuple:
-    r"""Cast each returned tensor to the dtype of its slot in
-    ``original_gi``; autograd rejects a hook that changes a slot's dtype,
+    r"""Cast each returned tensor to the dtype of its position in
+    ``original_gi``; autograd rejects a hook that changes a position's dtype,
     which happens when the rule math promotes bf16/fp16.
     """
     out = []
@@ -43,7 +43,7 @@ def _match_dtype(returned: tuple, original_gi: tuple) -> tuple:
             out.append(r.to(o.dtype))
         else:
             out.append(r)
-    # Preserve any trailing slots beyond the shorter sequence.
+    # Preserve any trailing positions beyond the shorter sequence.
     if len(returned) > len(original_gi):
         out.extend(returned[len(original_gi):])
     return tuple(out)
@@ -72,90 +72,21 @@ def _warn_missing_state(node, detail: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Shared machinery: relevance plumbing, rule resolution, tracing
+# Delivery: from shares to the tuple autograd accepts
 # ---------------------------------------------------------------------------
 
-def _reduce_to(t: torch.Tensor, target) -> torch.Tensor:
-    r"""Sum-reduce ``t`` to match ``target``'s shape.
-
-    Returns ``t`` unchanged when ``target`` is ``None`` or not a
-    tensor, or when the shapes already match.
-    """
-    if target is None or not isinstance(target, torch.Tensor) \
-            or t.shape == target.shape:
-        return t
-    return lrp_utils.reduce_to_shape(t, target.shape)
-
-def as_grad_tuple(gi, slot_shares):
-    r"""``{slot: R_share}`` to the tuple autograd accepts: slots autograd
-    gave as ``None`` stay ``None``, shares are sum-reduced to the operand's
-    shape, dtypes match ``gi``. Slots not in ``slot_shares`` are untouched.
+def as_grad_tuple(gi, shares):
+    r"""``{position: R_share}`` to the tuple autograd accepts. A share is
+    sum-reduced to the operand's shape and cast to its dtype; ``None``
+    means the operand is not attributed and gets zeros, not its native
+    gradient. Positions autograd gave as ``None`` stay ``None``;
+    positions not in ``shares`` are untouched.
     """
     out = list(gi)
-    for sl, share in slot_shares.items():
-        if sl < len(gi) and gi[sl] is not None and share is not None:
-            out[sl] = _reduce_to(share, gi[sl])
+    for position, share in shares.items():
+        if position < len(gi) and gi[position] is not None:
+            out[position] = torch.zeros_like(gi[position]) if share is None else reduce_to_shape(share, gi[position].shape)
     return _match_dtype(tuple(out), gi)
-
-def install_norm(node, config):
-    r"""``x.norm()`` / ``linalg.vector_norm``: a reduction whose native
-    gradient is ``x / ||x||``, a scaling. Share the output relevance
-    over the reduced elements in proportion to ``|x|``, the same policy
-    as our mean and sum."""
-    x = getattr(node, '_saved_self', None)
-    if x is None:
-        _warn_missing_state(
-            node, 'its saved input is unavailable -- the usual cause is '
-            'parameters with requires_grad=False; call p.requires_grad_(True) '
-            'on the model parameters')
-        return
-    dim = getattr(node, '_saved_dim', None)
-    keepdim = bool(getattr(node, '_saved_keepdim', False))
-    if isinstance(dim, int):
-        dim = (dim,)
-    elif dim is not None:
-        dim = tuple(dim)
-        if len(dim) == 0:
-            dim = None
-    eps = config.eps
-    rule = REDUCTION_RULES[REDUCTION_RULES.default]
-    _trace(None, rule.__name__)
-
-    def _hook(gi, go, _x=x, _dim=dim, _keep=keepdim, _eps=eps, _rule=rule):
-        R_in = _rule(_x, None, go[0], _eps, dim=_dim, keepdim=_keep)
-        return as_grad_tuple(gi, {0: R_in})
-    return node.register_hook(_hook)
-
-
-def install_cumsum(node, config):
-    r"""``cumsum``: a linear map with 0/1 weights, ``y_j = sum_{i<=j} x_i``.
-    The epsilon rule gives ``R_i = x_i * sum_{j>=i} R_j / y_j``, a reversed
-    cumulative sum of ``R / y``; the native gradient would hand every
-    ``x_i`` the full ``R_j`` of each later output."""
-    saved = getattr(node, 'saved_tensors', None)      # our Cumsum wrapper
-    if not saved or not hasattr(node, 'dim'):
-        return                                         # native: nothing to read
-    x, dim = saved[0], node.dim
-    eps = config.eps
-    _trace(None, 'epsilon (cumsum)')
-
-    def _hook(gi, go, _x=x, _dim=dim, _eps=eps):
-        with torch.no_grad():
-            y = torch.cumsum(_x, _dim)
-            s = go[0] / stabilize(y, _eps)
-            R_in = _x * torch.flip(torch.cumsum(torch.flip(s, (_dim,)), _dim), (_dim,))
-        return as_grad_tuple(gi, {0: R_in})
-    return node.register_hook(_hook)
-
-
-def _install_single_operand(node, slot):
-    r"""One live operand: the op is a scaling or a sign change of that
-    operand by a constant, and all relevance passes to it unchanged."""
-    _trace(None, 'passthrough (constant operand)')
-
-    def _hook(gi, go, _slot=slot):
-        return as_grad_tuple(gi, {_slot: go[0]})
-    return node.register_hook(_hook)
 
 
 def _reduce_gqa(r, n_rep):
@@ -167,346 +98,274 @@ def _reduce_gqa(r, n_rep):
 
 
 class _Named:
-    r"""A node presented under another name for config addressing, with
-    its own facts kept."""
+    r"""A node presented to ``resolve`` under another name, with its own
+    facts kept and ``facts`` added. For the fused attention node, which
+    is one node standing for two products and a softmax."""
     __slots__ = ('metadata', '_name')
 
-    def __init__(self, real, name):
-        self.metadata = {'lrp': dict(node_facts(real))}
+    def __init__(self, real, name, facts=None):
+        self.metadata = {'lrp': {**node_facts(real), **(facts or {})}}
         self._name = name
 
     def name(self):
         return self._name
 
 
-# ---- linear family (addmm / mm / conv / bmm) -------------------------
+# ---- two-operand nodes ------------------------------------------------
+#
+# A rule of a two-operand table returns (R_a, R_b), None for an operand
+# it does not attribute; which operands, ``attribute``, comes out of
+# resolve with the rule: from the entry, else from the node's facts.
 
-def _install_product(node, config, a, b, slot_a, slot_b, bias=None):
-    r"""Common installer for ``z = a @ b (+ bias)``: addmm, mm, bmm. Which
-    operands reach the wrapped input decides the family. One: a linear
-    layer with the other operand as weight, ``LINEAR_RULES``, all relevance
-    to that operand; an ``Addmm``/``Mm`` node is addressed by its own name,
-    a ``Bmm`` node as ``MmBackward``. Both: bilinear, addressed as
-    ``BmmBackward``, ``BMM_RULES``. Neither: nothing installs.
-    """
-    live = input_slots(node, (slot_a, slot_b))
-    if not live:
+def install_matmul(node, config):
+    r"""``z = a @ b (+ bias)``: addmm, mm and bmm."""
+    a, b = saved_tensors(node)
+    if a.tensor is None or b.tensor is None:
+        _warn_missing_state(node, _MISSING_LINEAR_STATE)
         return
-    eps = config.eps
-    rf = config.relevance_filter
-    T = lambda t: t.transpose(-2, -1)
+    bias = find_bias(node, position=0) if a.position == 1 else None    # addmm keeps its bias at 0
+    fn, kw = resolve(config.rule, node)
+    fwd0, bwd_a, bwd_b = mm_ops()
+    eps, rf = config.eps, config.relevance_filter
 
-    if len(live) == 2:
-        addr = node if 'BmmBackward' in node.name() else _Named(node, 'BmmBackward0')
-        fn, kw = resolve_rule(config.rule, addr, BMM_RULES)
-        fwd = lambda x, y: torch.matmul(x, y)
-        bwd_a = lambda o, s: torch.matmul(s, T(o))
-        bwd_b = lambda o, s: torch.matmul(T(o), s)
-
-        def _hook(gi, go, _fn=fn, _a=a, _b=b, _kw=kw, _bias=bias):
-            with torch.no_grad():
-                R_out = go[0]
-                if _bias is not None:
-                    R_out = apply_bias_split(R_out, fwd(_a, _b), _bias, eps)
-                R_a, R_b = _fn(_a, _b, R_out, eps, fwd, bwd_a, bwd_b, **_kw)
-            return as_grad_tuple(gi, {slot_a: R_a, slot_b: R_b})
-        return node.register_hook(_hook)
-
-    addr = node if 'BmmBackward' not in node.name() else _Named(node, 'MmBackward0')
-    rule_fn, rule_kwargs = resolve_rule(config.rule, addr, LINEAR_RULES)
-    if live[0] == slot_a:                       # x @ w
-        x, w, x_slot = a, b, slot_a
-        fwd = lambda x_, w_: torch.matmul(x_, w_)
-        bwd_a = lambda w_, s: torch.matmul(s, T(w_))
-        bwd_b = lambda x_, s: torch.matmul(T(x_), s)
-    else:                                       # w @ x
-        x, w, x_slot = b, a, slot_b
-        fwd = lambda x_, w_: torch.matmul(w_, x_)
-        bwd_a = lambda w_, s: torch.matmul(T(w_), s)
-        bwd_b = lambda x_, s: torch.matmul(s, T(x_))
-
-    def _hook(gi, go, _x=x, _w=w, _b=bias, _slot=x_slot,
-              _rule_fn=rule_fn, _rule_kw=rule_kwargs,
-              _fwd=fwd, _ba=bwd_a, _bb=bwd_b):
-        R_in, _ = run_linear_rule(
-            _x, _w, _b, go[0], _rule_fn, _rule_kw,
-            _fwd, _ba, _bb, eps, relevance_filter=rf)
-        return as_grad_tuple(gi, {_slot: R_in})
+    def _hook(gi, go, _a=a.tensor, _b=b.tensor):
+        with torch.no_grad():
+            fwd = cache_pair(fwd0)                       # z = fwd(a, b) once, shared with the rule
+            R_out = apply_bias_split(go[0], fwd(_a, _b), bias, eps) if bias is not None else go[0]
+            R_a, R_b = fn(_a, _b, R_out, eps, fwd, bwd_a, bwd_b, **kw)
+            if rf < 1.0:
+                R_a, R_b = (None if R is None else topk_filter(R, rf) for R in (R_a, R_b))
+        return as_grad_tuple(gi, {a.position: R_a, b.position: R_b})
     return node.register_hook(_hook)
-
-
-def install_addmm(node, config):
-    r"""``addmm(bias, mat1, mat2)``: slots 0 (bias), 1, 2."""
-    a = getattr(node, '_saved_mat1', None)
-    b = getattr(node, '_saved_mat2', None)
-    if a is None or b is None:
-        _warn_missing_state(node, _MISSING_LINEAR_STATE)
-        return
-    return _install_product(node, config, a, b, 1, 2,
-                            bias=find_bias(node, slot=0))
-
-
-def install_mm(node, config):
-    r"""``mm(self, mat2)``: slots 0, 1."""
-    a = getattr(node, '_saved_self', None)
-    b = getattr(node, '_saved_mat2', None)
-    if a is None or b is None:
-        _warn_missing_state(node, _MISSING_LINEAR_STATE)
-        return
-    return _install_product(node, config, a, b, 0, 1)
 
 
 def install_conv(node, config):
-    r"""Install the LRP hook for a ``ConvolutionBackward`` node.
-
-    Covers ``Conv1d`` / ``Conv2d`` / ``Conv3d`` and their transposed
-    forms (``_saved_transposed``). The input-gradient slot is ``gi[0]``.
-    """
-    x = getattr(node, '_saved_input', None)
-    w = getattr(node, '_saved_weight', None)
-    if x is None or w is None:
+    r"""``ConvolutionBackward``: ``Conv1d``/``2d``/``3d`` and their transposed
+    forms. The image is the first operand, the kernel its weight."""
+    x, w = saved_tensors(node)
+    if x.tensor is None or w.tensor is None:
         _warn_missing_state(node, _MISSING_LINEAR_STATE)
         return
-
-    stride = getattr(node, '_saved_stride', (1,) * (x.ndim - 2))
-    padding = getattr(node, '_saved_padding', (0,) * (x.ndim - 2))
-    dilation = getattr(node, '_saved_dilation', (1,) * (x.ndim - 2))
+    xt, wt = x.tensor, w.tensor
+    ndim = xt.ndim - 2
+    stride = getattr(node, '_saved_stride', (1,) * ndim)
+    padding = getattr(node, '_saved_padding', (0,) * ndim)
+    dilation = getattr(node, '_saved_dilation', (1,) * ndim)
     groups = getattr(node, '_saved_groups', 1)
-    ndim = x.ndim - 2
-
-    bias = find_bias(node, slot=2)
+    bias = find_bias(node, position=2)
     if bias is not None:
         bias = bias.view([1, -1] + [1] * ndim)
-
-    rule_fn, rule_kwargs = resolve_rule(config.rule, node, LINEAR_RULES)
     if getattr(node, '_saved_transposed', False):
         output_padding = getattr(node, '_saved_output_padding', (0,) * ndim)
-        fwd, bwd_a, bwd_b = conv_transposed_ops(
-            ndim, stride, padding, output_padding, dilation, groups, x, w)
+        fwd0, bwd_x, bwd_w = conv_transposed_ops(ndim, stride, padding, output_padding, dilation, groups, xt, wt)
     else:
-        fwd, bwd_a, bwd_b = conv_ops(ndim, stride, padding, dilation, groups, x.shape)
-    eps = config.eps
-    rf = config.relevance_filter
+        fwd0, bwd_x, bwd_w = conv_ops(ndim, stride, padding, dilation, groups, xt.shape)
+    fn, kw = resolve(config.rule, node)
+    eps, rf = config.eps, config.relevance_filter
 
-    def _hook(gi, go, _x=x, _w=w, _b=bias,
-              _rule_fn=rule_fn, _rule_kw=rule_kwargs,
-              _eps=eps, _fwd=fwd, _ba=bwd_a, _bb=bwd_b, _rf=rf):
-        R_out = go[0]
-        R_in, R_w = run_linear_rule(
-            _x, _w, _b, R_out, _rule_fn, _rule_kw,
-            _fwd, _ba, _bb, _eps, relevance_filter=_rf)
-        return as_grad_tuple(gi, {0: R_in, 1: R_w})
-
+    def _hook(gi, go):
+        with torch.no_grad():
+            fwd = cache_pair(fwd0)
+            R_out = apply_bias_split(go[0], fwd(xt, wt), bias, eps) if bias is not None else go[0]
+            R_x, R_w = fn(xt, wt, R_out, eps, fwd, bwd_x, bwd_w, **kw)
+            if rf < 1.0 and R_x is not None:
+                R_x = topk_filter(R_x, rf)
+        return as_grad_tuple(gi, {x.position: R_x, w.position: R_w})
     return node.register_hook(_hook)
-
-
-def install_bmm(node, config):
-    r"""``bmm(self, mat2)``: slots 0, 1. Two operands from the input is
-    the attention case (``BMM_RULES``); one is a batched linear layer
-    with a constant or parameter weight, addressed as ``MmBackward``."""
-    a = getattr(node, '_saved_self', None)
-    b = getattr(node, '_saved_mat2', None)
-    if a is None or b is None:
-        _warn_missing_state(node, _MISSING_LINEAR_STATE)
-        return
-    return _install_product(node, config, a, b, 0, 1)
 
 
 # ---- distributions (mul / div / add) ---------------------------------
 
 def install_mul(node, config):
-    r"""``MulBackward``: one operand from the input, relevance passes to it
-    unchanged; two, the entry that addresses the node (a fact, else
-    ``'MulBackward'``) picks from ``MUL_RULES``. The statistic transparency
-    of norms comes from the ``statistic_operand`` entry of ``BASE``.
-    """
-    live = live_slots(node)
-    if len(live) == 1:
-        return _install_single_operand(node, live[0])
-    a = getattr(node, '_saved_self', None)
-    b = getattr(node, '_saved_other', None)
-    if not isinstance(a, torch.Tensor) or not isinstance(b, torch.Tensor):
-        return
-
+    r"""``MulBackward``: the entry that addresses the node picks from
+    ``MUL_RULES``; with one operand from the input (``weight_operand``)
+    the rule attributes that side alone, all of the relevance. A native
+    mul saves an operand only if the other one needs a gradient, so with
+    a constant on one side the input is not saved; a one-sided rule does
+    not read it."""
+    a, b = saved_tensors(node)
+    fn, kw = resolve(config.rule, node)
     eps = config.eps
-    fn, kw = resolve_rule(config.rule, node, MUL_RULES)
-    fwd = lambda x, y: x * y
-    bwd_a = lambda o, s: s * o
-    bwd_b = lambda o, s: s * o
 
-    def _hook(gi, go, _fn=fn, _a=a, _b=b, _kw=kw, _eps=eps,
-              _fwd=fwd, _ba=bwd_a, _bb=bwd_b):
+    def _hook(gi, go, _a=a.tensor, _b=b.tensor):
         with torch.no_grad():
-            R_a, R_b = _fn(_a, _b, go[0], _eps, _fwd, _ba, _bb, **_kw)
-        return as_grad_tuple(gi, {0: R_a, 1: R_b})
-
+            R_a, R_b = fn(_a, _b, go[0], eps, **kw)
+        return as_grad_tuple(gi, {a.position: R_a, b.position: R_b})
     return node.register_hook(_hook)
 
+
 def install_div(node, config):
-    r"""``DivBackward``, as :func:`install_mul`; for ``'proportional'`` the
-    second operand enters as its stabilized reciprocal so the split
-    matches ``a * (1/b)``.
-    """
-    live = live_slots(node)
-    if len(live) == 1:
-        return _install_single_operand(node, live[0])
-    a = getattr(node, '_saved_self', None)
-    b = getattr(node, '_saved_other', None)
-    if not isinstance(a, torch.Tensor) or not isinstance(b, torch.Tensor):
-        return
-
+    r"""``DivBackward``, as :func:`install_mul`; the second operand enters
+    as its stabilized reciprocal so the split matches ``a * (1/b)``."""
+    a, b = saved_tensors(node)
+    b_inv = None if b.tensor is None else 1.0 / stabilize(b.tensor, config.eps)
+    fn, kw = resolve(config.rule, node)
     eps = config.eps
-    fn, kw = resolve_rule(config.rule, node, MUL_RULES)
 
-    def _hook(gi, go, _fn=fn, _a=a, _b=b, _kw=kw, _eps=eps):
+    def _hook(gi, go, _a=a.tensor, _b=b_inv):
         with torch.no_grad():
-            R_out = go[0]
-            b_inv = 1.0 / stabilize(_b, _eps)
-            aa = _a if _a.shape == R_out.shape else _a.expand_as(R_out)
-            bb = (b_inv if b_inv.shape == R_out.shape
-                  else b_inv.expand_as(R_out))
-            R_a, R_b = _fn(aa, bb, R_out, _eps, None, None, None, **_kw)
-        return as_grad_tuple(gi, {0: R_a, 1: R_b})
-
+            R_a, R_b = fn(_a, _b, go[0], eps, **kw)
+        return as_grad_tuple(gi, {a.position: R_a, b.position: R_b})
     return node.register_hook(_hook)
 
 
 def install_add(node, config):
     r"""Our ``AddBackward``/``SubBackward`` (saved operands): the entry that
     addresses the node picks from ``ADD_RULES``. A native add or sub saved
-    nothing, and its gradient runs.
-    """
-    saved = getattr(node, 'saved_tensors', None)
-    if not saved or len(saved) < 2:
+    nothing and its gradient runs: a constant summand is a bias."""
+    a, b = saved_tensors(node)
+    if a.tensor is None or b.tensor is None:
         return
-    sv, bv = saved[0], saved[1]
-    ps = node.next_functions
-    if len(ps) < 2:
-        return
-
-    fn, kw = resolve_rule(config.rule, node, ADD_RULES)
+    fn, kw = resolve(config.rule, node)
     eps = config.eps
-    fwd = lambda x, y: x + y
-    bwd_a = lambda o, s: s
-    bwd_b = lambda o, s: s
 
-    def _hook(gi, go, _fn=fn, _a=sv, _b=bv, _kw=kw, _eps=eps,
-              _fwd=fwd, _ba=bwd_a, _bb=bwd_b):
+    def _hook(gi, go, _a=a.tensor, _b=b.tensor):
         with torch.no_grad():
-            R_a, R_b = _fn(_a, _b, go[0], _eps, _fwd, _ba, _bb, **_kw)
-        return as_grad_tuple(gi, {0: R_a, 1: R_b})
-
+            R_a, R_b = fn(_a, _b, go[0], eps, **kw)
+        return as_grad_tuple(gi, {a.position: R_a, b.position: R_b})
     return node.register_hook(_hook)
 
 
 # ---- reductions (norm / cumsum / mean / sum) -------------------------
+
+def install_norm(node, config):
+    r"""``x.norm()`` / ``linalg.vector_norm``: a reduction whose native
+    gradient is ``x / ||x||``, a scaling. Share the output relevance
+    over the reduced elements in proportion to ``|x|``, the same policy
+    as our mean and sum."""
+    x, = (t.tensor for t in saved_tensors(node))
+    if x is None:
+        _warn_missing_state(
+            node, 'its saved input is unavailable -- the usual cause is '
+            'parameters with requires_grad=False; call p.requires_grad_(True) '
+            'on the model parameters')
+        return
+    dim = getattr(node, '_saved_dim', None)
+    keepdim = bool(getattr(node, '_saved_keepdim', False))
+    eps = config.eps
+    rule, kw = resolve(config.rule, node)
+
+    def _hook(gi, go, _x=x, _dim=dim, _keep=keepdim, _eps=eps, _rule=rule, _kw=kw):
+        R_in = _rule(_x, None, go[0], _eps, dim=_dim, keepdim=_keep, **_kw)
+        return as_grad_tuple(gi, {0: R_in})
+    return node.register_hook(_hook)
+
+
+def install_cumsum(node, config):
+    r"""Our ``CumsumBackward``: the rule in ``config.rule`` (``epsilon``,
+    :func:`~autolrp.backward.rules.cumsum_epsilon`). A native node saved
+    nothing and keeps its gradient."""
+    x, = (t.tensor for t in saved_tensors(node))
+    if x is None or not hasattr(node, 'dim'):
+        return                                         # native: nothing to read
+    dim = node.dim
+    eps = config.eps
+    rule, kw = resolve(config.rule, node)
+
+    def _hook(gi, go, _x=x, _dim=dim, _eps=eps, _rule=rule, _kw=kw):
+        with torch.no_grad():
+            R_in = _rule(_x, None, go[0], _eps, dim=_dim, **_kw)
+        return as_grad_tuple(gi, {0: R_in})
+    return node.register_hook(_hook)
+
 
 def install_mean_or_sum(node, config):
     r"""Our ``MeanBackward``/``SumBackward``: share ``R_out`` over the
     reduced elements in proportion to ``|x|``. A native node saved
     nothing and keeps its gradient.
     """
-    saved = getattr(node, 'saved_tensors', None)
-    if not saved or len(saved) == 0:
+    activation, = (t.tensor for t in saved_tensors(node))
+    if activation is None:
         return
-    activation = saved[0]
 
     if not hasattr(node, 'dim'):
         return  # not our wrapper -- can't recover dim/keepdim
-    raw_dim = node.dim
-    keepdim = getattr(node, 'keepdim', False)
-
-    # the rule wants None or a tuple of ints
-    if raw_dim is None:
-        dim = None
-    elif isinstance(raw_dim, int):
-        dim = (raw_dim,)
-    else:
-        dim = tuple(raw_dim)
-    rule = REDUCTION_RULES[REDUCTION_RULES.default]
-    _trace(None, rule.__name__)
+    dim, keepdim = node.dim, getattr(node, 'keepdim', False)
+    rule, kw = resolve(config.rule, node)
 
     def _hook(gi, go, _x=activation, _dim=dim, _keepdim=keepdim,
-              _eps=config.eps, _rule=rule):
-        R_in = _rule(_x, None, go[0], _eps, dim=_dim, keepdim=_keepdim)
+              _eps=config.eps, _rule=rule, _kw=kw):
+        R_in = _rule(_x, None, go[0], _eps, dim=_dim, keepdim=_keepdim, **_kw)
         return as_grad_tuple(gi, {0: R_in})
 
     return node.register_hook(_hook)
 
 
 # ---------------------------------------------------------------------------
-# Softmax variants (chosen by config.softmax)
+# One-operand installers: elementwise, softmax, layer norm
 # ---------------------------------------------------------------------------
 
-def _softmax_saved(node):
-    saved = getattr(node, 'saved_tensors', None)
-    if not saved or len(saved) < 2:
-        return None                          # not our Softmax: nothing saved
-    return {'x': saved[0], 'y': saved[1], 'dim': getattr(node, 'dim', -1)}
+def _install_unary(node, config, x, y, **saved):
+    r"""Register the hook of a one-operand node: ``rule(x, y, R_out, eps,
+    **saved, **kw)`` into position 0, the rule resolved from ``config.rule``.
+    A passthrough entry installs the plain passthrough hook."""
+    fn, kw = resolve(config.rule, node)
+    if fn is _rules_passthrough:
+        return _passthrough_hook(node)
+    eps = config.eps
+
+    def _hook(gi, go, _fn=fn, _kw=kw, _x=x, _y=y, _saved=saved, _eps=eps):
+        with torch.no_grad():
+            R_in = _fn(_x, _y, go[0], _eps, **_saved, **_kw)
+        return as_grad_tuple(gi, {0: R_in})
+    return node.register_hook(_hook)
 
 
-def _layernorm_saved(node):
-    x = getattr(node, '_saved_input', None)
+def _nothing_saved(node, config):
+    """A rule other than passthrough asked for state the node did not keep:
+    say so once, report it, pass relevance through."""
+    fn, _ = resolve(config.rule, node)
+    if fn is not _rules_passthrough:
+        _warn_missing_state(node, f"{fn.__name__} needs the node's input and "
+                                  f"output, which it did not save")
+        _trace(None, f'{fn.__name__}: nothing saved, passthrough')
+    return _passthrough_hook(node)
+
+
+def install_elementwise(node, config):
+    r"""Our elementwise wrappers (``forward/ops.py``) save ``(x, y)``; a
+    native node is a calling form the rewrite declined."""
+    x, y = (t.tensor for t in saved_tensors(node))
+    if x is None or y is None:
+        return _nothing_saved(node, config)
+    return _install_unary(node, config, x, y)
+
+
+def install_softmax(node, config):
+    r"""Our ``Softmax`` saves ``(x, y)`` and its ``dim``; a native softmax
+    saved only ``y``."""
+    x, y = (t.tensor for t in saved_tensors(node))
+    if x is None or y is None:
+        return _nothing_saved(node, config)
+    return _install_unary(node, config, x, y, dim=getattr(node, 'dim', -1))
+
+
+def install_layernorm(node, config):
+    r"""Native ``NativeLayerNormBackward``: input, affine weight and bias,
+    and the saved mean and rstd; the normalized shape is a parameter."""
+    x, weight, bias, mean, rstd = (t.tensor for t in saved_tensors(node))
     ns = getattr(node, '_saved_normalized_shape', None)
     if x is None or ns is None:
-        return None
-    return {'x': x, 'y': None, 'normalized_shape': ns,
-            'weight': getattr(node, '_saved_weight', None),
-            'bias': getattr(node, '_saved_bias', None),
-            'mean': getattr(node, '_saved_result1', None),
-            'rstd': getattr(node, '_saved_result2', None)}
-
-
-def _activation_saved(node):
-    x = getattr(node, '_saved_self', None)
-    if x is None:
-        return None                          # only the output saved: no rule
-    y = getattr(node, '_saved_result', None)
-    if y is None:
-        name = node.name()
-        fwd = next((fn for key, fn in ACTIVATION_FORWARD.items()
-                    if key in (name, name.rstrip('0123456789'))), None)
-        if fwd is None:
-            return None
-        with torch.no_grad():
-            y = fwd(x)
-    return {'x': x, 'y': y}
-
-
-def _unary_installer(kind, read_saved, rule):
-    r"""The installer for one entry of a unary rule table: read what the
-    node saved with ``read_saved``, register a hook that calls
-    ``rule(x, y, R_out, eps, **saved)``. When the node saved nothing the
-    rule needs, relevance passes through."""
-    def install(node, config):
-        if rule is _rules_passthrough:
-            return install_passthrough(node, config)
-        saved = read_saved(node)
-        if saved is None:
-            return install_passthrough(node, config)
-        x, y = saved.pop('x'), saved.pop('y')
-        eps = config.eps
-
-        def _hook(gi, go, _x=x, _y=y, _saved=saved):
-            with torch.no_grad():
-                R_in = rule(_x, _y, go[0], eps, **_saved)
-            return as_grad_tuple(gi, {0: R_in})
-        return node.register_hook(_hook)
-    install.__name__ = f'install_{kind}_{rule.__name__}'
-    return install
+        return _nothing_saved(node, config)
+    return _install_unary(node, config, x, None, normalized_shape=ns, weight=weight, bias=bias,
+                          mean=mean, rstd=rstd)
 
 
 # ---- passthrough -----------------------------------------------------
 
-def install_passthrough(node, config):
-    r"""``R_in = R_out`` into slot 0: activations, norms, softmax under the
-    default field, sign-preserving unaries. ``None`` slots stay ``None``.
-    """
-    _trace(None, 'passthrough')
-
+def _passthrough_hook(node):
     def _hook(gi, go):
         return as_grad_tuple(gi, {0: go[0]})
     return node.register_hook(_hook)
+
+
+def install_passthrough(node, config):
+    r"""``R_in = R_out`` into position 0: norms without a rule table,
+    sign-preserving unaries, and any rule-bearing node that saved nothing
+    its rule needs. ``None`` positions stay ``None``.
+    """
+    _trace(None, 'passthrough')
+    return _passthrough_hook(node)
 
 
 def install_noop(node, config):
@@ -518,55 +377,27 @@ def install_noop(node, config):
 
 # ---- fused attention (consults the BmmBackward rule entry) ----
 
-class _AsBmm:
-    r"""Stand-in for one of the two products a fused attention node
-    performs. Answers ``name()`` as a bmm so a ``'BmmBackward'`` entry
-    reaches it. For ``A @ V`` it carries ``weights_operand: 0`` (the
-    weights are on the left by construction); for ``Q @ K^T`` it carries
-    no such fact, exactly like the score bmm of the decomposed graph.
-    The real node's own facts are copied underneath either way."""
-
-    __slots__ = ('metadata',)
-
-    def __init__(self, real, weights_on_left=False):
-        facts = dict(node_facts(real))
-        if weights_on_left:
-            facts['weights_operand'] = 0
-        self.metadata = {'lrp': facts}
-
-    def name(self):
-        return 'BmmBackward0'
-
-
-def _fused_product(config, node, live_left, live_right, weights_on_left):
+def _fused_shares(config, node, live_left, live_right, weights_on_left):
     r"""The relevance function for one product ``L @ Rt`` inside a fused
     attention node: ``(L, Rt, R_out) -> (R_L, R_Rt)``, or ``None`` when
-    neither operand comes from the input. Same family choice as
-    :func:`_install_product`."""
+    neither operand comes from the input. Resolved as the decomposed
+    graph's bmm would be: both live, the ``bilinear`` fact (and
+    ``attention_weights: 0`` for ``A @ V``, whose weights are on its left
+    by construction); one live, ``weight_operand`` on the other."""
     eps = config.eps
-    rf = config.relevance_filter
-    T = lambda t: t.transpose(-2, -1)
-    fwd = lambda x, y: torch.matmul(x, y)
-    bwd_a = lambda o, s: torch.matmul(s, T(o))
-    bwd_b = lambda o, s: torch.matmul(T(o), s)
-    if live_left and live_right:
-        fn, kw = resolve_rule(config.rule, _AsBmm(node, weights_on_left), BMM_RULES)
-        return lambda L, Rt, R: fn(L, Rt, R, eps, fwd, bwd_a, bwd_b, **kw)
     if not (live_left or live_right):
         return None
-    rule_fn, kw = resolve_rule(config.rule, _Named(node, 'MmBackward0'), LINEAR_RULES)
-    if live_left:
-        def run(L, Rt, R):
-            R_L, _ = run_linear_rule(L, Rt, None, R, rule_fn, kw, fwd, bwd_a, bwd_b, eps, relevance_filter=rf)
-            return R_L, torch.zeros_like(Rt)
+    if live_left and live_right:
+        facts = {'bilinear': True, 'attention_weights': 0} if weights_on_left else {'bilinear': True}
     else:
-        fwd_r = lambda x, w: torch.matmul(w, x)
-        bwd_ar = lambda w, s: torch.matmul(T(w), s)
-        bwd_br = lambda x, s: torch.matmul(s, T(x))
+        facts = {'weight_operand': 1 if live_left else 0}
+    fn, kw = resolve(config.rule, _Named(node, 'BmmBackward0', facts))
+    fwd, bwd_a, bwd_b = mm_ops()
 
-        def run(L, Rt, R):
-            R_Rt, _ = run_linear_rule(Rt, L, None, R, rule_fn, kw, fwd_r, bwd_ar, bwd_br, eps, relevance_filter=rf)
-            return torch.zeros_like(L), R_Rt
+    def run(L, Rt, R):
+        R_L, R_Rt = fn(L, Rt, R, eps, fwd, bwd_a, bwd_b, **kw)
+        return (torch.zeros_like(L) if R_L is None else R_L,       # not attributed: zeros
+                torch.zeros_like(Rt) if R_Rt is None else R_Rt)
     return run
 
 
@@ -576,14 +407,12 @@ def install_sdpa(node, config):
     attention matrix from the saved query, key, value and logsumexp, then
     runs the same rules the decomposed graph would: each of the two
     products resolved by which operands come from the input
-    (:func:`_fused_product`), the softmax addressed as ``SoftmaxBackward``
+    (:func:`_fused_shares`), the softmax addressed as ``SoftmaxBackward``
     through :class:`_Named`.
-    Writes the query, key and value slots; GQA expands K and V and sums
+    Writes the query, key and value positions; GQA expands K and V and sums
     the relevance back over the repeated heads.
     """
-    q = getattr(node, '_saved_query', None)
-    k = getattr(node, '_saved_key', None)
-    v = getattr(node, '_saved_value', None)
+    q, k, v = (t.tensor for t in saved_tensors(node))
     lse = getattr(node, '_saved_logsumexp', None)
     if lse is None:
         lse = getattr(node, '_saved_log_sumexp', None)
@@ -599,18 +428,17 @@ def install_sdpa(node, config):
     # One node stands for softmax and two products; each product is
     # resolved on its own, as the decomposed graph would.
     ps = parents(node, skip_aliases=False)
-    live_q, live_k, live_v = (i < len(ps) and reaches_input(ps[i]) for i in range(3))
+    live_q, live_k, live_v = (i < len(ps) and ps[i] is not None and reaches_input(ps[i]) for i in range(3))
     live_a = live_q or live_k
-    _av = _fused_product(config, node, live_a, live_v, weights_on_left=True)
-    _qk = _fused_product(config, node, live_q, live_k, weights_on_left=False)
+    _av = _fused_shares(config, node, live_a, live_v, weights_on_left=True)
+    _qk = _fused_shares(config, node, live_q, live_k, weights_on_left=False)
     if _av is None and _qk is None:
         return
-    softmax_name, _ = resolve(config.softmax, _Named(node, 'SoftmaxBackward'))
-    _trace(None, f'softmax={softmax_name}')
+    softmax_fn, _ = resolve(config.rule, _Named(node, 'SoftmaxBackward0'))
 
     def _hook(gi, go, _q=q, _k=k, _v=v, _lse=lse, _mask=mask,
               _is_causal=is_causal, _scale=scale, _eps=eps,
-              _av=_av, _qk=_qk, _softmax=softmax_name):
+              _av=_av, _qk=_qk, _softmax=softmax_fn):
         with torch.no_grad():
             R_out = go[0]
             B, Hq, T, D = _q.shape
@@ -628,7 +456,7 @@ def install_sdpa(node, config):
             R_A = torch.zeros_like(Af) if R_A is None else R_A
             R_V = torch.zeros_like(Vf) if R_V is None else R_V
             # softmax: R_A -> R_scores (relevance at the scaled-masked scores)
-            R_scores = SOFTMAX_RULES[_softmax](fl(scores), fl(A), R_A, _eps, dim=-1)
+            R_scores = _softmax(fl(scores), fl(A), R_A, _eps, dim=-1)
             # The `*scale` is a constant multiplication: relevance passes
             # through it unchanged, as in the decomposed path.
             Qf, Ktf = fl(_q), fl(k_e.transpose(-2, -1))
@@ -651,40 +479,3 @@ def install_sdpa(node, config):
         return _match_dtype(tuple(out), gi)
 
     return node.register_hook(_hook)
-
-
-# ---------------------------------------------------------------------------
-# Handler tables for the unary config fields
-# ---------------------------------------------------------------------------
-
-SOFTMAX_HANDLERS: dict = {
-    name: _unary_installer('softmax', _softmax_saved, fn)
-    for name, fn in SOFTMAX_RULES.items()}
-
-LAYERNORM_HANDLERS: dict = {
-    name: _unary_installer('layernorm', _layernorm_saved, fn)
-    for name, fn in LAYERNORM_RULES.items()}
-
-ACTIVATION_HANDLERS: dict = {
-    name: _unary_installer('activation', _activation_saved, fn)
-    for name, fn in ACTIVATION_RULES.items()}
-
-
-ACTIVATION_FORWARD = {
-    'ReluBackward':        F.relu,
-    'LeakyReluBackward':   F.leaky_relu,
-    'GeluBackward':        F.gelu,
-    'SiluBackward':        F.silu,
-    'TanhBackward':        torch.tanh,
-    'SigmoidBackward':     torch.sigmoid,
-    'HardtanhBackward':    F.hardtanh,
-    'HardswishBackward':   F.hardswish,
-    'HardsigmoidBackward': F.hardsigmoid,
-    'EluBackward':         F.elu,
-    'SeluBackward':        F.selu,
-    'CeluBackward':        F.celu,
-    'SoftplusBackward':    F.softplus,
-    'SoftsignBackward':    F.softsign,
-    'LogSigmoidBackward':  F.logsigmoid,
-    'MishBackward':        F.mish,
-}

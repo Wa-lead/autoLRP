@@ -1,11 +1,10 @@
 r"""Machinery under the rules. Nothing here decides how relevance is
 split; these are the tensor helpers the rules and installers share:
 the stabilizer, broadcast reduction, the bias split, the linear-family
-driver ``run_linear_rule``, the kernel builders for matmul and
+the kernel builders for matmul and
 convolution, and the fused-attention reconstruction. ``rules`` imports
 this file, never the reverse.
 """
-from typing import Callable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -74,7 +73,7 @@ def topk_filter(t: torch.Tensor, k: float) -> torch.Tensor:
 
 def cache_pair(f):
     r"""Identity-keyed memo for a two-argument kernel, for one call of
-    :func:`run_linear_rule`: ``z = fwd(x, w)`` is computed once and shared
+    the two-operand hook: ``z = fwd(x, w)`` is computed once and shared
     by the bias split and the rule; a call with substituted operands
     (``fwd(x_pos, w_pos)``) misses the cache and computes normally."""
     cache = {}
@@ -87,36 +86,6 @@ def cache_pair(f):
     return g
 
 
-def run_linear_rule(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    R_out: torch.Tensor,
-    rule_fn: Callable,
-    rule_kwargs: dict,
-    fwd: Callable,
-    bwd_a: Callable,
-    bwd_b: Callable,
-    eps: float,
-    relevance_filter: float = 1.0,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    r"""One linear-family step: ``z = fwd(x, w)`` without bias, the bias
-    split of ``R_out``, ``rule_fn(x, w, R, eps, fwd, bwd_a, bwd_b,
-    **kwargs)``, then the optional top-fraction filter. ``fwd`` is
-    memoized for this call, so the rule's own ``fwd(x, w)`` is the same
-    ``z``. Returns ``(R_in, R_w)``; the linear rules give ``R_w = None``
-    so the weight slot keeps its native gradient."""
-    with torch.no_grad():
-        fwd = cache_pair(fwd)
-        z = fwd(x, w)
-        R_scaled = apply_bias_split(R_out, z, bias, eps)
-        R_in, R_w = rule_fn(x, w, R_scaled, eps, fwd, bwd_a, bwd_b,
-                            **rule_kwargs)
-        if relevance_filter < 1.0:
-            R_in = topk_filter(R_in, relevance_filter)
-        return R_in, R_w
-
-
 # ---------------------------------------------------------------------------
 # Kernel builders: (fwd, bwd_a, bwd_b) for an op
 #   fwd(x, w)    the op without bias
@@ -125,10 +94,13 @@ def run_linear_rule(
 # ---------------------------------------------------------------------------
 
 def mm_ops():
-    r"""Kernels for ``x @ w``."""
-    return (lambda x, w: x @ w,
-            lambda w, s: s @ w.transpose(-2, -1),
-            lambda x, s: x.transpose(-2, -1) @ s)
+    r"""Kernels for ``a @ b`` as ``(fwd, bwd_a, bwd_b)``: the product, its
+    VJP into ``a``, its VJP into ``b``. ``matmul``, so batched operands
+    broadcast as they do in the model."""
+    T = lambda t: t.transpose(-2, -1)
+    return (lambda a, b: torch.matmul(a, b),
+            lambda b, s: torch.matmul(s, T(b)),
+            lambda a, s: torch.matmul(T(a), s))
 
 
 def conv_ops(ndim: int, stride, padding, dilation, groups, x_shape):

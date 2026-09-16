@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 import autolrp
-from autolrp import LRPConfig, BASE, explain, explain_summary, register_analyzer, ANALYZERS
+from autolrp import LRPConfig, BASE, CPLRP, ATTNLRP, explain, explain_summary, register_analyzer, ANALYZERS
 
 
 def _layer():
@@ -17,38 +17,40 @@ class TestExplain:
     def test_rows_name_the_entry_and_the_function(self):
         blk = _layer()
         x = autolrp.tensor(torch.randn(1, 5, 8))
-        rows = explain(blk(x)[0, -1, 0], LRPConfig(attn='cplrp'))
+        rows = explain(blk(x)[0, -1, 0], LRPConfig(rule={**BASE, **CPLRP}))
         by = {}
         for node, key, what in rows:
             by.setdefault((node, key, what), 0)
             by[(node, key, what)] += 1
-        assert by[('AddmmBackward0', 'AddmmBackward', 'epsilon')] == 4
-        assert by[('BmmBackward0', 'weights_operand', 'detach_lhs_bmm')] == 1
-        assert by[('BmmBackward0', 'BmmBackward', 'epsilon_bmm')] == 1
-        assert by[('SoftmaxBackward', None, 'softmax=passthrough')] == 1
-        assert by[('DivBackward0', None, 'passthrough (constant operand)')] == 1
+        assert by[('AddmmBackward0', 'AddmmBackward', 'epsilon (lhs)')] == 4
+        assert by[('BmmBackward0', 'bilinear', 'epsilon (rhs)')] == 1     # A @ V: the values only
+        assert by[('BmmBackward0', 'bilinear', 'epsilon (both)')] == 1    # Q @ K^T: both sides
+        assert by[('SoftmaxBackward', 'SoftmaxBackward', 'passthrough')] == 1
+        assert by[('NativeLayerNormBackward0', 'NativeLayerNormBackward', 'layernorm_identity')] == 2
+        assert by[('ReluBackward', 'ReluBackward', 'passthrough')] == 1
+        assert by[('MulBackward0', 'MulBackward', 'proportional (lhs)')] == 1     # the attention scale: a weight on the right
         assert 'AddmmBackward0' in explain_summary(rows)
 
     def test_explain_leaves_no_trace(self):
         blk = _layer()
         X = torch.randn(1, 5, 8)
         x1 = autolrp.tensor(X.clone()); out = blk(x1)
-        explain(out[0, -1, 0], LRPConfig(attn='attnlrp'))
-        out[0, -1, 0].lrp(config=LRPConfig(attn='attnlrp'))
-        x2 = autolrp.tensor(X.clone()); blk(x2)[0, -1, 0].lrp(config=LRPConfig(attn='attnlrp'))
+        explain(out[0, -1, 0], LRPConfig(rule={**BASE, **ATTNLRP}))
+        out[0, -1, 0].lrp(config=LRPConfig(rule={**BASE, **ATTNLRP}))
+        x2 = autolrp.tensor(X.clone()); blk(x2)[0, -1, 0].lrp(config=LRPConfig(rule={**BASE, **ATTNLRP}))
         assert torch.equal(x1.relevance, x2.relevance)
 
 
 class TestAnalyzerValues:
     def test_a_bare_value_is_the_fact_value(self):
         register_analyzer('every_linear')(
-            lambda nodes: {n: True for n in nodes if 'AddmmBackward' in n.name()})
+            lambda node: True if 'AddmmBackward' in node.name() else None)
         try:
             m = nn.Sequential(nn.Linear(6, 5), nn.ReLU(), nn.Linear(5, 1))
             x = autolrp.tensor(torch.randn(1, 6))
             rows = explain(m(x).sum(), LRPConfig(rule={**BASE, 'every_linear': 'zplus'}))
             assert [r for r in rows if r[0] == 'AddmmBackward0'] == \
-                [('AddmmBackward0', 'every_linear', 'zplus')] * 2
+                [('AddmmBackward0', 'every_linear', 'zplus (lhs)')] * 2
         finally:
             ANALYZERS.pop('every_linear')
 

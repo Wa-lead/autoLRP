@@ -1,12 +1,14 @@
 r"""Reading the autograd graph: the producers of a node's operands,
-which subgraphs reach a wrapped input, a node's facts and saved
-operands, and a layer's bias. Every other backward file asks these
-questions; none of them decides anything about relevance.
+which subgraphs reach a wrapped input, a node's facts, and a layer's
+bias. What a node saved is read in :mod:`autolrp.nodes`, beside the
+table that says where each kind keeps it. Nothing here decides anything
+about relevance.
 """
 from collections import deque
 from typing import Dict, Optional
 
 import torch
+
 
 
 def node_facts(node) -> dict:
@@ -18,14 +20,6 @@ def node_facts(node) -> dict:
     return {}
 
 
-def is_weight_leaf(var) -> bool:
-    """A leaf that carries no relevance of its own. Relevance flows to
-    what the user wrapped with :func:`autolrp.tensor`; every other leaf,
-    an ``nn.Parameter``, a constant the forward intercept made live, a
-    plain tensor with ``requires_grad``, is a weight."""
-    return not getattr(var, '_lrp_init', False)
-
-
 def is_leaf(node) -> bool:
     r"""``True`` iff ``node`` is a leaf accumulator (``AccumulateGrad``), the
     node autograd gives a tensor nothing computed: a parameter, a constant
@@ -33,10 +27,12 @@ def is_leaf(node) -> bool:
     return 'AccumulateGrad' in node.name()
 
 
-def is_input_leaf(node) -> bool:
+def is_input(node) -> bool:
     r"""``True`` iff ``node`` is the leaf of a tensor the user wrapped with
-    :func:`autolrp.tensor`; parameter and constant leaves are weights."""
-    return is_leaf(node) and not is_weight_leaf(getattr(node, 'variable', None))
+    :func:`autolrp.tensor`. Relevance flows to inputs; every other leaf, a
+    parameter, a constant the forward intercept made live, a plain tensor
+    with ``requires_grad``, is a weight."""
+    return is_leaf(node) and bool(getattr(getattr(node, 'variable', None), '_lrp_init', False))
 
 
 def topo_order(nodes):
@@ -64,31 +60,30 @@ def topo_order(nodes):
     return order
 
 
-def bfs_order(nodes):
+def bfs_order(nodes, removed=None):
     r"""Every node reachable from ``nodes`` through :func:`parents`, each
-    once, breadth-first from them (children before parents): the
-    plan order the engine, ``explain`` and the analyzers see."""
-    order, seen, queue = [], set(), deque(nodes)
+    once, breadth-first (children before parents): the plan order the
+    engine, ``explain`` and the analyzers see. Lazy, so a caller that
+    stops early walks only what it looked at. ``removed`` is a node the
+    walk refuses to enter, which cuts its subgraph out."""
+    seen, queue = {}, deque(nodes)                 # id -> node: holds the wrappers, so an id is never reused mid-walk
     while queue:
         node = queue.popleft()
-        if node is None or id(node) in seen:
+        if node is None or node is removed or id(node) in seen:
             continue
-        seen.add(id(node))
-        order.append(node)
-        for p in parents(node, skip_aliases=False):
-            if p is not None and id(p) not in seen:
-                queue.append(p)
-    return order
+        seen[id(node)] = node
+        yield node
+        queue.extend(parents(node, skip_aliases=False))
 
 
-def leaf_reach(nodes) -> Dict[int, bool]:
-    r"""``reach[id(node)] = True`` iff ``node``'s subgraph contains a wrapped
-    input leaf (:func:`is_weight_leaf`): a fold over :func:`topo_order`,
-    so every parent is decided before its children."""
+def reaches_input_map(nodes) -> Dict[int, bool]:
+    r""":func:`reaches_input` for every node at once: ``map[id(node)]`` is
+    ``True`` iff ``node``'s subgraph contains an input leaf. A fold over
+    :func:`topo_order`, so every parent is decided before its children."""
     reach: Dict[int, bool] = {}
     for node in topo_order(nodes):
         if is_leaf(node):
-            reach[id(node)] = is_input_leaf(node)
+            reach[id(node)] = is_input(node)
         else:
             reach[id(node)] = any(reach.get(id(p), False)
                                 for p in parents(node, skip_aliases=False)
@@ -97,37 +92,15 @@ def leaf_reach(nodes) -> Dict[int, bool]:
 
 
 def reaches_input(node) -> bool:
-    """``True`` iff ``node`` reaches a wrapped input leaf. A parameter or a
-    constant (including a constant made live by the forward intercept)
-    does not; only the path from the user's ``tensor(...)`` does."""
-    return _reaches_input_avoiding(node, None)
+    """``True`` iff relevance sent to ``node`` can arrive at a wrapped input:
+    an input leaf lies under it. A parameter or a constant (including one
+    the forward intercept made live) does not."""
+    return any(is_input(n) for n in bfs_order([node]))
 
 
-def _reaches_input_avoiding(start, forbidden) -> bool:
-    r"""``True`` iff ``start`` reaches an input leaf without passing
-    through ``forbidden``. A search that stops at the first input leaf,
-    not a fold: it runs once per installed node.
-    """
-    if start is None:
-        return False
-    seen = set()
-    stack = [start]
-    while stack:
-        node = stack.pop()
-        if node is None or node is forbidden:
-            continue
-        nid = id(node)
-        if nid in seen:
-            continue
-        seen.add(nid)
-        if is_leaf(node):
-            if is_input_leaf(node):
-                return True
-            continue                      # parameter leaf: keep searching
-        for parent in parents(node, skip_aliases=False):
-            if parent is not None and parent is not forbidden:
-                stack.append(parent)
-    return False
+def reaches_input_without(start, removed) -> bool:
+    r""":func:`reaches_input` with the subgraph under ``removed`` cut out."""
+    return any(is_input(n) for n in bfs_order([start], removed))
 
 
 def _skip_aliases(node):
@@ -142,54 +115,25 @@ def _skip_aliases(node):
 
 
 def parents(node, skip_aliases: bool = True):
-    r"""Producing nodes of ``node``'s operand slots, in slot order; ``None``
-    for a slot with no producer. With ``skip_aliases`` (default) chains
+    r"""Producing nodes of ``node``'s operand positions, in position order; ``None``
+    for a position with no producer. With ``skip_aliases`` (default) chains
     of ``AliasBackward`` are collapsed to the first real op.
     """
     ps = [q for q, _ in getattr(node, 'next_functions', ())]
     return [_skip_aliases(q) for q in ps] if skip_aliases else ps
 
 
-def operands(node):
-    r"""Saved operand tensors ``(a, b)`` of a two-operand node, or
-    ``(None, None)``; native ops save ``_saved_self``/``_saved_other``,
-    our wrapped ops save through ``saved_tensors``.
-    """
-    a = getattr(node, '_saved_self', None)
-    b = getattr(node, '_saved_other', None)
-    if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
-        return a, b
-    saved = getattr(node, 'saved_tensors', None)
-    if saved and len(saved) >= 2 and all(isinstance(t, torch.Tensor) for t in saved[:2]):
-        return saved[0], saved[1]
-    return None, None
-
-
-def find_bias(node, slot: int) -> Optional[torch.Tensor]:
-    r"""The 1-D bias tensor in operand ``slot`` of ``node`` (0 for
-    ``Addmm``, 2 for ``Convolution``), detached, or ``None`` when the slot
+def find_bias(node, position: int) -> Optional[torch.Tensor]:
+    r"""The 1-D bias tensor in operand ``position`` of ``node`` (0 for
+    ``Addmm``, 2 for ``Convolution``), detached, or ``None`` when the position
     is empty, computed, or not a vector.
     """
     ps = parents(node, skip_aliases=False)
-    if len(ps) <= slot:
+    if len(ps) <= position:
         return None
-    bias_node = ps[slot]
+    bias_node = ps[position]
     if bias_node is not None and is_leaf(bias_node):
         v = bias_node.variable
         if v.ndim == 1:
             return v.detach()
     return None
-
-
-def live_slots(node):
-    """Operand slots of ``node`` that relevance can flow to: the ones with a
-    producer. A constant operand (a Python number, a tensor without grad)
-    has none, so ``next_functions`` holds ``None`` there."""
-    return [i for i, p in enumerate(parents(node, skip_aliases=False))
-            if p is not None]
-
-
-def input_slots(node, slots):
-    """Which of ``slots`` hold an operand that reaches the wrapped input."""
-    ps = parents(node, skip_aliases=False)
-    return [i for i in slots if i < len(ps) and reaches_input(ps[i])]

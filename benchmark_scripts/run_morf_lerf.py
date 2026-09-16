@@ -56,7 +56,7 @@ def build_attribute(method, task, model, tok, emb, kind, args, device):
     r"""Return a closure attribute(input_ids, target) -> relevance for this method."""
     if method == "autolrp":
         _find_autolrp(args.autolrp_repo)
-        from autolrp import LRPConfig
+        from autolrp import LRPConfig, on, SOFTMAX_NODES, LAYERNORM_NODES, ELEMENTWISE_NODES
         from _recipe import make_rule
         # Build the text (LLaMA) config from CLI knobs. Defaults are the faithful
         # config: gamma=1.0 linears + softmax=jacobian (the imdb/wiki fix) +
@@ -67,10 +67,10 @@ def build_attribute(method, task, model, tok, emb, kind, args, device):
             rule['AddBackward'] = ('fixed', {'p': float(args.residual_split)})
         except ValueError:
             rule['AddBackward'] = args.residual_split  # 'proportional' | 'equal'
-        cfg = LRPConfig(
-            rule=rule,
-            softmax=args.softmax, layernorm=args.layernorm,
-            activation=args.activation)
+        rule.update(on(SOFTMAX_NODES, args.softmax))
+        rule.update(on(LAYERNORM_NODES, args.layernorm))
+        rule.update(on(ELEMENTWISE_NODES, args.activation))
+        cfg = LRPConfig(rule=rule)
         ok = "logits"
         return lambda ids, tgt: A.attribute_autolrp(
             model, ids, tgt, embed_layer=emb, config=cfg, device=device, output_kind=ok)
@@ -119,7 +119,7 @@ def main():
     # softmax as identity and under-attributed attention (probe-localized to the
     # attention block; residual/RMSNorm/MLP all agree).
     # jacobian only affects imdb/wiki (vit/vgg use build_vit_config / build_vgg_config).
-    ap.add_argument("--softmax", default="jacobian", choices=["passthrough", "jacobian", "detach"])
+    ap.add_argument("--softmax", default="jacobian", choices=["passthrough", "jacobian", "gate"])
     ap.add_argument("--layernorm", default="passthrough", choices=["passthrough", "yx", "detach_std"])
     ap.add_argument("--activation", default="passthrough", choices=["passthrough", "yx"])
     ap.add_argument("--bilinear", default="full", choices=["full", "cplrp", "uniform"])
@@ -127,7 +127,7 @@ def main():
     # ViT-only ablation overrides (default None = use build_vit_config's paper values:
     # softmax=passthrough, bilinear=full). Lets us test whether the LLaMA attention
     # fix (jacobian softmax) also closes the vit gap.
-    ap.add_argument("--vit-softmax", default=None, choices=["passthrough", "jacobian", "detach"])
+    ap.add_argument("--vit-softmax", default=None, choices=["passthrough", "jacobian", "gate"])
     ap.add_argument("--vit-bilinear", default=None, choices=["full", "cplrp", "uniform"])
     ap.add_argument("--autolrp-repo", default=None)
     ap.add_argument("--imagenet-dir", default=None)
@@ -221,7 +221,7 @@ def main():
             # passthrough recovers the old baseline.
             vcfg = build_vit_config(softmax=(args.vit_softmax or "jacobian"),
                                     bilinear=(args.vit_bilinear or "full"))
-            print(f"[vit] softmax={vcfg.softmax} bmm={vcfg.rule['BmmBackward']}")
+            print(f"[vit] softmax={vcfg.rule['SoftmaxBackward']} bilinear={vcfg.rule.get('bilinear', 'epsilon (BASE)')}")
         else:
             vcfg = build_vgg_config()
 

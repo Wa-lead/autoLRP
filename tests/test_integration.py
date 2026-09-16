@@ -10,7 +10,7 @@ import torch.nn as nn
 
 import autolrp
 from tests._cfg import on_linear
-from autolrp import BASE
+from autolrp import BASE, on, SOFTMAX_NODES, UNIFORM
 from autolrp import LRPConfig
 
 
@@ -169,9 +169,8 @@ def _lrp_relevance(model, data, decompose, cfg):
 
 _SDPA_CFGS = [
     ('default', LRPConfig()),                                   # cplrp + passthrough
-    ('attnlrp', LRPConfig(softmax='jacobian')),
-    ('uniform', LRPConfig(softmax='passthrough',
-                          rule={**BASE, 'BmmBackward': 'uniform'})),
+    ('attnlrp', LRPConfig(rule={**BASE, **on(SOFTMAX_NODES, 'jacobian')})),
+    ('uniform', LRPConfig(rule={**BASE, **UNIFORM})),
 ]
 
 

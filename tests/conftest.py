@@ -60,7 +60,7 @@ def _isolate():
     _engine._UNMATCHED_WARNED.clear()
     _install._MISSING_STATE_WARNED.clear()
     _rules._GAMMA_DEGENERATION_WARNED.clear()
-    _intercept._INPLACE_REMAP_WARNED.clear()
+    _intercept._WARNED.clear()
 
     yield
 

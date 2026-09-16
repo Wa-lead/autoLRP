@@ -58,7 +58,7 @@ def perturbation_curve(
     """
     if mode not in ('deletion', 'insertion'):
         raise ValueError(f"mode must be 'deletion' or 'insertion'; got {mode!r}")
-    x0 = _input(x)
+    x0 = x.detach().as_subclass(torch.Tensor)     # perturbed copies are scored with the native model, not re-wrapped
     rel = _relevance(x, R).expand_as(x0)
     base = _baseline(x0, baseline)
     order = torch.argsort(rel.abs().reshape(-1), descending=True)
@@ -122,12 +122,6 @@ def faithfulness(
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
-
-def _input(x: torch.Tensor) -> torch.Tensor:
-    r"""``x`` as a plain detached tensor: perturbed copies are scored with
-    the native model, not re-wrapped."""
-    return x.detach().as_subclass(torch.Tensor)
-
 
 def _relevance(x: torch.Tensor, R: Optional[torch.Tensor]) -> torch.Tensor:
     if R is None:

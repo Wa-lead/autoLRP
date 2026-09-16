@@ -2,11 +2,13 @@
 
 - A key is a node name without its version digit or a fact name; a fact
   entry wins over the name entry on the nodes that carry the fact.
-- Rule names are positional: ``detach_lhs`` zeros the operand written
-  on the left of that op, always. The one virtual name ``'detach'``
-  takes ``by=<fact>`` and is resolved per node from the fact's value.
-- A product node's family is decided by which operands reach the
-  wrapped input, not by the node's name.
+- ``attribute`` is positional: ``('epsilon', {'attribute': 'rhs'})``
+  attributes the operand written on the right of that op, always. The one
+  virtual name ``'detach'`` takes ``by=<fact>`` and attributes the operand
+  the fact does not name, resolved per node from the fact's value.
+- Which operands of a product are attributed is decided by which reach
+  the wrapped input (the facts ``bilinear`` and ``weight_operand``), not
+  by the node's name.
 - The fused attention node resolves each of its two products through a
   stand-in and gives the same relevance as the decomposed graph.
 """
@@ -18,11 +20,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import autolrp
-from autolrp import LRPConfig, BASE, set_decompose_attention, node_facts, walk
+from autolrp import (LRPConfig, BASE, CPLRP, ATTNLRP, UNIFORM, on, SOFTMAX_NODES,
+                     set_decompose_attention, node_facts, walk, resolve)
 from autolrp.backward import analysis
-from autolrp.backward.install import resolve_rule, _AsBmm, _Named
-from autolrp.backward.rules import FAMILIES, BMM_RULES, LINEAR_RULES, MUL_RULES
-from autolrp.backward.strategies import build_strategy
+from autolrp.backward.install import _Named
+from autolrp.backward.rules import PRODUCT_RULES, MUL_RULES
 
 
 def _bmm_attn_model(transposed):
@@ -60,7 +62,7 @@ X = torch.randn(1, 5, 6, dtype=torch.float64)
 class TestVirtualDetach:
     def test_spelling_invariance_via_by(self):
         sd = _bmm_attn_model(False).state_dict()
-        cfg = LRPConfig(attn='cplrp', eps=1e-12)
+        cfg = LRPConfig(rule={**BASE, **CPLRP}, eps=1e-12)
         ms = _bmm_attn_model(False); ms.load_state_dict(sd)
         mt = _bmm_attn_model(True); mt.load_state_dict(sd)
         with warnings.catch_warnings():
@@ -71,7 +73,7 @@ class TestVirtualDetach:
 
     def test_concrete_names_are_positional(self):
         sd = _bmm_attn_model(False).state_dict()
-        cfg = LRPConfig(rule={**BASE, 'BmmBackward': 'detach_lhs'}, eps=1e-12)
+        cfg = LRPConfig(rule={**BASE, 'BmmBackward': ('epsilon', {'attribute': 'rhs'})}, eps=1e-12)
         ms = _bmm_attn_model(False); ms.load_state_dict(sd)
         mt = _bmm_attn_model(True); mt.load_state_dict(sd)
         assert not torch.allclose(_run(ms, X, cfg), _run(mt, X, cfg), atol=1e-9)
@@ -80,23 +82,23 @@ class TestVirtualDetach:
         sd = _bmm_attn_model(False).state_dict()
         m1 = _bmm_attn_model(False); m1.load_state_dict(sd)
         m2 = _bmm_attn_model(False); m2.load_state_dict(sd)
-        Rv = _run(m1, X, LRPConfig(attn='cplrp', eps=1e-12))
-        Rc = _run(m2, X, LRPConfig(rule={**BASE, 'BmmBackward': 'detach_lhs'}, eps=1e-12))
+        Rv = _run(m1, X, LRPConfig(rule={**BASE, **CPLRP}, eps=1e-12))
+        Rc = _run(m2, X, LRPConfig(rule={**BASE, 'BmmBackward': ('epsilon', {'attribute': 'rhs'})}, eps=1e-12))
         assert torch.allclose(Rv, Rc, atol=1e-12)
 
     def test_absent_fact_runs_the_family_fallback_quietly(self):
-        """A 'detach' keyed by the family name reaches the score bmm,
-        which carries no weights_operand fact; the table fallback
-        (epsilon) runs there, silently, and the result equals the
-        explicit two-entry spelling."""
+        """A 'detach' keyed by the node name reaches the score bmm,
+        which carries no attention_weights fact; the table default
+        (epsilon, both operands) runs there, silently, and the result
+        equals the CPLRP fragment keyed by the bilinear fact."""
         sd = _bmm_attn_model(False).state_dict()
         m1 = _bmm_attn_model(False); m1.load_state_dict(sd)
         m2 = _bmm_attn_model(False); m2.load_state_dict(sd)
         with warnings.catch_warnings():
             warnings.simplefilter('error')
             R1 = _run(m1, X, LRPConfig(rule={**BASE, 'BmmBackward':
-                                             ('detach', {'by': 'weights_operand'})}, eps=1e-12))
-        R2 = _run(m2, X, LRPConfig(attn='cplrp', eps=1e-12))
+                                             ('detach', {'by': 'attention_weights'})}, eps=1e-12))
+        R2 = _run(m2, X, LRPConfig(rule={**BASE, **CPLRP}, eps=1e-12))
         assert torch.allclose(R1, R2, atol=1e-12)
 
     def test_present_fact_that_is_not_a_side_is_an_error(self):
@@ -161,10 +163,9 @@ class TestStatisticEntry:
         assert torch.allclose(x1.relevance, x2.relevance, atol=1e-12)
 
 
-class TestResolveRule:
+class TestResolve:
     def _node(self, out, name):
-        cfg = LRPConfig()
-        plan = walk(out, build_strategy(cfg), cfg)
+        plan = walk(out)
         analysis.run(plan)
         return next(n for n, _ in plan if name in n.name())
 
@@ -172,54 +173,43 @@ class TestResolveRule:
         x = autolrp.tensor(torch.randn(2, 4)); y = autolrp.tensor(torch.randn(2, 4))
         out = (x * y).sum()
         node = self._node(out, 'MulBackward')
-        fn, kw = resolve_rule({**BASE, 'MulBackward': 'proportional'}, node, MUL_RULES)
+        fn, kw = resolve({**BASE, 'MulBackward': 'proportional'}, node)
         assert fn is MUL_RULES['proportional'] and kw == {}
 
-    def test_kwargs_come_back_without_by(self):
+    def test_detach_resolves_to_the_table_rule_on_the_other_side(self):
         m = _bmm_attn_model(False)
         x = autolrp.tensor(X.clone()); out = m(x)
-        cfg = LRPConfig(attn='cplrp')
-        plan = walk(out, build_strategy(cfg), cfg); analysis.run(plan)
-        tagged = [n for n, _ in plan if node_facts(n).get('weights_operand') == 0]
+        cfg = LRPConfig(rule={**BASE, **CPLRP})
+        plan = walk(out); analysis.run(plan)
+        tagged = [n for n, _ in plan if node_facts(n).get('attention_weights') == 0]
         assert len(tagged) == 1
-        fn, kw = resolve_rule(cfg.rule, tagged[0], BMM_RULES)
-        assert fn is BMM_RULES['detach_lhs'] and kw == {}
+        fn, kw = resolve(cfg.rule, tagged[0])
+        assert fn is PRODUCT_RULES['epsilon'] and kw == {'attribute': 'rhs'}
 
     def test_wrong_family_names_entry_node_and_choices(self):
         x = autolrp.tensor(torch.randn(2, 4)); y = autolrp.tensor(torch.randn(2, 4))
         node = self._node((x * y).sum(), 'MulBackward')
         with pytest.raises(ValueError, match=r"entry 'MulBackward'='zbox'.*MulBackward0.*'proportional'"):
-            resolve_rule({**BASE, 'MulBackward': 'zbox'}, node, MUL_RULES)
+            resolve({**BASE, 'MulBackward': 'zbox'}, node)
 
     def test_no_entry_names_the_node_and_the_key_to_add(self):
         x = autolrp.tensor(torch.randn(2, 4)); y = autolrp.tensor(torch.randn(2, 4))
         node = self._node((x * y).sum(), 'MulBackward')
         with pytest.raises(ValueError, match="no entry for node 'MulBackward0'. Add 'MulBackward'"):
-            resolve_rule({'AddBackward': 'equal'}, node, MUL_RULES)
+            resolve({'AddBackward': 'equal'}, node)
 
     def test_two_fact_entries_on_one_node_is_an_error(self):
         from autolrp import register_analyzer, ANALYZERS
         register_analyzer('also_weights')(
-            lambda nodes: {n: 'also_weights' for n in nodes if 'BmmBackward' in n.name()})
+            lambda node: True if 'BmmBackward' in node.name() else None)
         try:
             m = _bmm_attn_model(False)
             x = autolrp.tensor(X.clone())
             with pytest.raises(ValueError, match="two entries address"):
-                m(x).lrp(config=LRPConfig(rule={**BASE, 'weights_operand': 'uniform',
+                m(x).lrp(config=LRPConfig(rule={**BASE, 'attention_weights': 'gradient_input',
                                                 'also_weights': 'epsilon'}))
         finally:
             ANALYZERS.pop('also_weights')
-
-    def test_an_analyzer_writes_only_its_own_fact(self):
-        from autolrp import register_analyzer, ANALYZERS
-        register_analyzer('one_name')(
-            lambda nodes: {n: {'other_name': 1} for n in nodes if 'MulBackward' in n.name()})
-        try:
-            x = autolrp.tensor(torch.randn(2, 4)); y = autolrp.tensor(torch.randn(2, 4))
-            with pytest.raises(ValueError, match="writes only the fact it is registered as"):
-                (x * y).sum().lrp()
-        finally:
-            ANALYZERS.pop('one_name')
 
 
 class TestProductFamilyByLiveness:
@@ -240,28 +230,29 @@ class TestProductFamilyByLiveness:
         torch.manual_seed(0)
         blk = nn.TransformerEncoderLayer(8, 2, 16, dropout=0.0, batch_first=True).double().eval()
         Xd = torch.randn(1, 5, 8, dtype=torch.float64)
-        x1 = autolrp.tensor(Xd.clone()); blk(x1).sum().lrp(config=LRPConfig(attn='attnlrp'))
+        x1 = autolrp.tensor(Xd.clone()); blk(x1).sum().lrp(config=LRPConfig(rule={**BASE, **ATTNLRP}))
         for p in blk.parameters():
             p.requires_grad_(False)
         with warnings.catch_warnings():
             warnings.simplefilter('error')
-            x2 = autolrp.tensor(Xd.clone()); blk(x2).sum().lrp(config=LRPConfig(attn='attnlrp'))
+            x2 = autolrp.tensor(Xd.clone()); blk(x2).sum().lrp(config=LRPConfig(rule={**BASE, **ATTNLRP}))
         assert torch.equal(x1.relevance, x2.relevance)
 
-    def test_bmm_with_a_constant_weight_is_addressed_as_mm(self):
+    def test_bmm_with_a_constant_weight_is_not_bilinear(self):
         torch.manual_seed(0)
         W = torch.randn(1, 3, 4, dtype=torch.float64)
         x = autolrp.tensor(torch.randn(1, 2, 3, dtype=torch.float64))
-        torch.bmm(x, W).sum().lrp(config=LRPConfig(rule={**BASE, 'BmmBackward': 'uniform'}))
+        torch.bmm(x, W).sum().lrp(config=LRPConfig(rule={**BASE, **UNIFORM}))   # the bilinear entry does not reach it
         assert abs(x.relevance.sum().item() - 1.0) < 1e-9
 
-    def test_mm_with_both_operands_from_the_input_is_addressed_as_bmm(self):
+    def test_mm_with_both_operands_from_the_input_is_bilinear(self):
         torch.manual_seed(0)
-        x = autolrp.tensor(torch.randn(2, 3, dtype=torch.float64))
-        (x @ x.T).sum().lrp(config=LRPConfig(rule={**BASE, 'BmmBackward': 'uniform', 'MmBackward': 'zplus'}))
+        data = torch.randn(2, 3, dtype=torch.float64)
+        x = autolrp.tensor(data.clone())
+        (x @ x.T).sum().lrp(config=LRPConfig(rule={**BASE, **UNIFORM, 'MmBackward': 'zplus'}))
         r_uniform = x.relevance.clone()
-        x = autolrp.tensor(torch.randn(2, 3, dtype=torch.float64))
-        (x @ x.T).sum().lrp(config=LRPConfig(rule={**BASE, 'BmmBackward': 'epsilon', 'MmBackward': 'zplus'}))
+        x = autolrp.tensor(data.clone())
+        (x @ x.T).sum().lrp(config=LRPConfig(rule={**BASE, 'MmBackward': 'zplus'}))
         assert not torch.allclose(r_uniform, x.relevance)
 
     def test_a_plain_requires_grad_tensor_is_a_weight(self):
@@ -301,13 +292,15 @@ class TestConstantOperands:
 class TestFusedStandIns:
     def test_stand_ins_answer_as_the_decomposed_nodes(self):
         real = _Named(object.__new__(object), 'X')  # facts of a bare object: none
-        assert _AsBmm(real, weights_on_left=True).name() == 'BmmBackward0'
-        assert node_facts(_AsBmm(real, weights_on_left=True)) == {'weights_operand': 0}
-        assert node_facts(_AsBmm(real)) == {}
+        av = _Named(real, 'BmmBackward0', {'bilinear': True, 'attention_weights': 0})
+        assert av.name() == 'BmmBackward0'
+        assert node_facts(av) == {'bilinear': True, 'attention_weights': 0}
+        assert node_facts(_Named(real, 'BmmBackward0')) == {}
 
     @pytest.mark.parametrize('cfg', [
-        LRPConfig(attn='cplrp'), LRPConfig(attn='attnlrp'), LRPConfig(attn='uniform'),
-        LRPConfig(rule={**BASE, 'weights_operand': 'uniform', 'BmmBackward': 'epsilon'}, softmax='jacobian'),
+        LRPConfig(rule={**BASE, **CPLRP}), LRPConfig(rule={**BASE, **ATTNLRP}), LRPConfig(rule={**BASE, **UNIFORM}),
+        LRPConfig(rule={**BASE, 'attention_weights': 'gradient_input',
+                        **on(SOFTMAX_NODES, 'jacobian')}),
     ])
     def test_fused_equals_decomposed_per_product(self, cfg):
         torch.manual_seed(0)
@@ -338,6 +331,6 @@ class TestFusedStandIns:
         k = autolrp.tensor(torch.randn(1, 2, 5, d, dtype=torch.float64))
         v = autolrp.tensor(torch.randn(1, 2, 5, d, dtype=torch.float64))
         F.scaled_dot_product_attention(q, k, v).sum().lrp(
-            config=LRPConfig(rule={**BASE, 'BmmBackward': 'epsilon'}, softmax='passthrough'))
+            config=LRPConfig(rule={**BASE, 'BmmBackward': 'epsilon'}))
         assert abs(v.relevance.sum().item() - 0.5) < 1e-6
         assert abs(q.relevance.sum().item() + k.relevance.sum().item() - 0.5) < 1e-6

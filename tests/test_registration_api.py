@@ -26,8 +26,8 @@ class TestRegistrationIdioms:
 
     def test_analyzer_and_rewrite_decorators(self):
         @A.register_analyzer('fake_fact')
-        def an(nodes):
-            return {}
+        def an(node):
+            return None
 
         @A.register_rewrite('fake_fn')
         def rw(func, args, kwargs):

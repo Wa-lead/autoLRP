@@ -12,10 +12,10 @@ import torch
 from . import analysis
 from .strategies import (
     Strategy, EXPLICIT_STRATEGY, match_installer, is_shape_node,
-    build_strategy,
+    INSTALLERS,
 )
 from ..config import LRPConfig
-from .graph import leaf_reach, parents, bfs_order, is_leaf, is_input_leaf
+from .graph import reaches_input_map, bfs_order, is_leaf, is_input
 
 
 PlanItem = Tuple[object, Optional[Callable]]   # (node, installer or None)
@@ -71,7 +71,7 @@ def walk(output: torch.Tensor,
     # An unmatched node matters only on the path to a wrapped input;
     # one that reaches no input (an embedding lookup of ids, a
     # parameter-only branch) receives relevance that lands nowhere.
-    reach = leaf_reach([n for n, _ in plan])
+    reach = reaches_input_map([n for n, _ in plan])
     for node, installer in plan:
         name = node.name()
         if (installer is None and not is_leaf(node)
@@ -102,7 +102,7 @@ def explain(output: torch.Tensor, config=None, strategy=None):
     from . import resolve as _resolve
     if config is None:
         config = LRPConfig()
-    plan = walk(output, strategy=strategy or build_strategy(config), config=config)
+    plan = walk(output, strategy=strategy or INSTALLERS, config=config)
     analysis.run(plan)
     rows, handles = [], []
     _resolve._TRACE = trace = []
@@ -157,13 +157,19 @@ def _unit_seed(t: torch.Tensor) -> torch.Tensor:
     return torch.ones_like(t.detach())
 
 
-def _backward(output: torch.Tensor) -> None:
-    r"""Seed ``output`` with :math:`+1` and run backward.
-
-    Uses ``retain_graph=True`` so the :class:`LRPTensor` input-side
-    hook can store the incoming gradient as ``.relevance``.
+def _backward(output: torch.Tensor, plan) -> None:
+    r"""Seed ``output`` with :math:`+1` and run the backward to the wrapped
+    inputs only. ``torch.autograd.grad`` with the input leaves as
+    ``inputs`` computes nothing off the path to them: no weight
+    gradients, and nothing written into the model's ``param.grad``.
+    The :class:`LRPTensor` hook stores each input's gradient as
+    ``.relevance``. ``retain_graph`` keeps the graph for a second call.
     """
-    output.backward(gradient=_unit_seed(output), retain_graph=True)
+    inputs = [node.variable for node, _ in plan if is_input(node)]
+    if not inputs:
+        raise RuntimeError("no wrapped input under this output: wrap it with autolrp.tensor(...)")
+    torch.autograd.grad(output, inputs, grad_outputs=_unit_seed(output),
+                        retain_graph=True, allow_unused=True)
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +241,7 @@ def execute(plan: List[PlanItem], output: torch.Tensor,
                 handles.extend(result)
             else:
                 handles.append(result)
-        _backward(output)
+        _backward(output, plan)
     finally:
         for h in handles:
             h.remove()
@@ -256,23 +262,23 @@ def graph_lrp(output: torch.Tensor,
     if config is None:
         config = LRPConfig()
     if strategy is None:
-        strategy = build_strategy(config)
+        strategy = INSTALLERS
 
     # Warn-once state is per call, so a second model warns again.
     from .install import _MISSING_STATE_WARNED
     from .rules import _GAMMA_DEGENERATION_WARNED
-    from ..forward.intercept import _INPLACE_REMAP_WARNED
+    from ..forward.intercept import _WARNED
     _UNMATCHED_WARNED.clear()
     _CAPTURE_PREHOOK_WARNED.clear()
     _MISSING_STATE_WARNED.clear()
     _GAMMA_DEGENERATION_WARNED.clear()
-    _INPLACE_REMAP_WARNED.clear()
+    _WARNED.clear()
 
     plan = walk(output, strategy=strategy, config=config)
     # A wrapped input leaf must be reachable. `_lrp_init` is set by
     # tensor() and dropped by detach(), so a `.detach().requires_grad_()`
     # inside the forward, which severs the path, fails this check.
-    if not any(is_input_leaf(n)
+    if not any(is_input(n)
                and not isinstance(getattr(n, 'variable', None),
                                   torch.nn.Parameter)
                for n, _ in plan):

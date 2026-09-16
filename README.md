@@ -87,11 +87,11 @@ Notebook: [CLRP](examples/showcase/paper_impl/03_clrp_vgg16.ipynb)
 
 ### Attention rule variant (CP-LRP)
 
-One keyword switches the attention rule ([Ali et al. 2022](https://arxiv.org/abs/2202.07304)).
+One preset fragment switches the attention rule ([Ali et al. 2022](https://arxiv.org/abs/2202.07304)).
 Notebook: [attention presets](examples/showcase/extras/03_attention_fused_vs_decomposed.ipynb)
 
 ```python
-out[0, pred].lrp(config=LRPConfig(attn='cplrp'))
+out[0, pred].lrp(config=LRPConfig(rule={**BASE, **CPLRP}))
 ```
 
 <p align="center">
@@ -139,10 +139,10 @@ Override entries on it, or use a preset:
 ```python
 LRPConfig(rule={**BASE, 'AddmmBackward': 'zplus'})
 LRPConfig(rule={**BASE, 'ConvolutionBackward': ('gamma', {'gamma': 0.25})})
-LRPConfig.composite()               # z+ on conv, epsilon elsewhere
-LRPConfig(attn='attnlrp')           # epsilon products, Jacobian softmax
-LRPConfig(attn='cplrp')             # attention weights treated as constants
-LRPConfig(attn='uniform')
+LRPConfig.composite()                 # z+ on conv, epsilon elsewhere
+LRPConfig(rule={**BASE, **ATTNLRP})   # epsilon products, Jacobian softmax
+LRPConfig(rule={**BASE, **CPLRP})     # attention weights treated as constants
+LRPConfig(rule={**BASE, **UNIFORM})
 ```
 
 The config says exactly what runs. A key that is not a node name or a
@@ -156,14 +156,19 @@ LRPConfig(rule={**BASE, 'MulBackward': 'zbox'})
   ValueError: rule entry 'MulBackward'='zbox': 'zbox' is not a choice here. Choices: [...]
 ```
 
-Rule tables, by family:
+Rule tables, by kind of two-operand node:
 
-| family   | node names                                           | rules                                                               |
-| -------- | ---------------------------------------------------- | ------------------------------------------------------------------- |
-| linear   | `AddmmBackward`, `MmBackward`, `ConvolutionBackward` | `epsilon`, `zplus`, `gamma`, `gamma_montavon`, `alpha_beta`, `zbox` |
-| bilinear | `BmmBackward`                                        | `epsilon`, `uniform`, `detach_lhs`, `detach_rhs`                    |
-| product  | `MulBackward`, `DivBackward`                         | `proportional`, `detach_lhs`, `detach_rhs`                          |
-| sum      | `AddBackward`, `SubBackward`                         | `proportional`, `equal`, `fixed`, `detach_lhs`, `detach_rhs`        |
+| kind    | node names                                                          | rules                                                                                 |
+| ------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| product | `AddmmBackward`, `MmBackward`, `BmmBackward`, `ConvolutionBackward` | `epsilon`, `zplus`, `gamma`, `gamma_montavon`, `alpha_beta`, `zbox`, `gradient_input` |
+| mul     | `MulBackward`, `DivBackward`                                        | `proportional`, `passthrough`                                                         |
+| add     | `AddBackward`, `SubBackward`                                        | `proportional`, `equal`, `fixed`, `passthrough`                                       |
+
+A product attributes the operand that comes from the wrapped input, or both
+with half the relevance each when both do (the fact `bilinear`). An entry can
+say which with `attribute`, `('zplus', {'attribute': 'rhs'})`. The fact
+`attention_weights` names the softmax side of an attention product; `CPLRP`
+is `{'bilinear': ('detach', {'by': 'attention_weights'})}`.
 
 ## Citing
 

@@ -137,9 +137,6 @@ cython_debug/
 # macOS
 .DS_Store
 
-# Claude Code
-.claude/
-
 # benchmark raw outputs
 benchmark_scripts/results/
 
@@ -148,3 +145,6 @@ benchmark_scripts/probes/
 benchmark_scripts/RESULTS_n100.md
 *dlrp*
 *DLRP*
+
+# stray archives
+*.zip

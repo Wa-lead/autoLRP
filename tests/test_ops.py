@@ -19,7 +19,7 @@ import torch.nn.functional as F
 
 import autolrp
 from tests._cfg import on_linear
-from autolrp import BASE
+from autolrp import BASE, on, SOFTMAX_NODES
 from autolrp import LRPConfig
 
 
@@ -125,7 +125,7 @@ def test_activation_produces_finite_input_shaped_R(act_cls):
 
 
 # BMM — distinct parametrize axis (BmmBackward rule entry).
-@pytest.mark.parametrize("bmm_rule", ['epsilon', 'detach_lhs'])
+@pytest.mark.parametrize("bmm_rule", ['epsilon', 'gradient_input', ('zplus', {'attribute': 'rhs'})])
 def test_bmm_two_data_operands(bmm_rule):
     # Both operands live: with a constant rhs, autograd does not save
     # _saved_self and the installer falls back (loudly) to native --
@@ -157,10 +157,10 @@ def test_sum_reduction(dim, keepdim):
 
 
 # Softmax — three modes.
-@pytest.mark.parametrize("mode", ['passthrough', 'detach', 'jacobian'])
+@pytest.mark.parametrize("mode", ['passthrough', 'gate', 'jacobian'])
 def test_softmax_mode_produces_finite_R(mode):
     R = _run_lrp(torch.randn(2, 8), lambda x: torch.softmax(x, dim=-1),
-                 softmax=mode)
+                 rule={**BASE, **on(SOFTMAX_NODES, mode)})
     _assert_ok(R, (2, 8))
 
 

@@ -16,9 +16,15 @@ import torch
 import torch.nn as nn
 
 import autolrp
-from autolrp import LRPConfig, EXPLICIT_STRATEGY, INSTALLERS, merge, register_installer, installer
+from autolrp import LRPConfig, EXPLICIT_STRATEGY, INSTALLERS, merge, register_installer
 from autolrp.backward.strategies import match_installer, is_shape_node
-from autolrp.backward.install import install_passthrough, install_noop
+from autolrp import RULES_FOR
+from autolrp.backward.install import (
+    install_passthrough, install_noop,
+    install_matmul, install_conv, install_mul, install_div, install_add,
+    install_softmax, install_layernorm, install_elementwise, install_mean_or_sum, install_norm,
+    install_cumsum,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +198,7 @@ def test_custom_installer_is_called():
 
 
 # ---------------------------------------------------------------------------
-# register_installer + @installer decorator (public extension API)
+# register_installer, call and decorator forms (public extension API)
 # ---------------------------------------------------------------------------
 
 class TestRegisterInstaller:
@@ -216,13 +222,35 @@ class TestRegisterInstaller:
             INSTALLERS.pop(unique_key, None)
 
     def test_decorator_equivalent(self):
-        """``@installer('Pat')`` produces the same registry effect as
+        """``@register_installer('Pat')`` produces the same registry effect as
         ``register_installer('Pat', fn)``."""
         unique_key = 'ZZ_DecoratorBackward_For_Test'
         try:
-            @installer(unique_key)
+            @register_installer(unique_key)
             def my_install(node, config):
                 return None
             assert INSTALLERS[unique_key] is my_install
         finally:
             INSTALLERS.pop(unique_key, None)
+
+
+# ---------------------------------------------------------------------------
+# The rule map and the strategy cannot drift apart.
+# ---------------------------------------------------------------------------
+
+class TestRuleMapMatchesStrategy:
+    RULE_INSTALLERS = {
+        install_matmul, install_conv, install_mul, install_div, install_add,
+        install_softmax, install_layernorm, install_elementwise, install_mean_or_sum, install_norm,
+        install_cumsum,
+    }
+
+    def test_every_rule_map_key_reaches_a_rule_running_installer(self):
+        for name in RULES_FOR:
+            pattern, inst = match_installer(name + '0', EXPLICIT_STRATEGY)
+            assert pattern == name and inst in self.RULE_INSTALLERS, name
+
+    def test_every_rule_running_installer_sits_under_a_rule_map_key(self):
+        for pattern, inst in EXPLICIT_STRATEGY.items():
+            if inst in self.RULE_INSTALLERS:
+                assert pattern in RULES_FOR, pattern

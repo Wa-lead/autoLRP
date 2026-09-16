@@ -18,40 +18,46 @@ import torch.nn as nn
 import torch as _torch
 
 from autolrp.backward.lrp_utils import (
-    run_linear_rule, stabilize, mm_ops,
+    stabilize, mm_ops, cache_pair, apply_bias_split,
 )
 from autolrp.backward.rules import reduction_proportional
 from tests._cfg import on_linear
 from autolrp import BASE
 from autolrp.backward.rules import (
-    epsilon, zplus, alpha_beta, gamma, zbox, BMM_RULES,
+    epsilon, zplus, alpha_beta, gamma, zbox, PRODUCT_RULES,
 )
 
 
 # ---------------------------------------------------------------------------
 # Thin adapters: keep every test body written against the small kernel
 # vocabulary while calling the CURRENT public machinery underneath.
-# run_linear_rule returns (R_in, R_w); the weight share is not under test
-# here. BMM rules and reductions are called through their real tables.
+# A product rule attributes its first operand by default and returns
+# (R_a, R_b) with None for the other; the matmul hook's bias split is
+# reproduced here. Bilinear forms call the same table with ``attribute``.
 # ---------------------------------------------------------------------------
 
 def compute_linear_family_r_in(x, w, bias, R_out, rule_fn, rule_kw,
                                fwd, bwd_a, bwd_b, eps):
-    R_in, _ = run_linear_rule(x, w, bias, R_out, rule_fn, rule_kw,
-                              fwd, bwd_a, bwd_b, eps)
+    with torch.no_grad():
+        fwd = cache_pair(fwd)
+        R = apply_bias_split(R_out, fwd(x, w), bias, eps)
+        R_in, _ = rule_fn(x, w, R, eps, fwd, bwd_a, bwd_b, **rule_kw)
     return R_in
 
 
-_BMM_NAME = {'full': 'epsilon', 'cplrp': 'detach_lhs',
-             'uniform': 'uniform'}
+_BMM = {'full': ('epsilon', 'both'),            # AttnLRP bilinear epsilon: each side half the relevance
+        'cplrp': ('epsilon', 'rhs'),            # CP-LRP: the weights (first operand) get nothing
+        'uniform': ('gradient_input', 'both')}  # LXT uniform
 
 
 def compute_bmm_r_in(a, b, R_out, eps, bilinear):
     fwd = lambda x, y: _torch.bmm(x, y)
     bwd_a = lambda o, s: _torch.bmm(s, o.transpose(-2, -1))
     bwd_b = lambda o, s: _torch.bmm(o.transpose(-2, -1), s)
-    return BMM_RULES[_BMM_NAME[bilinear]](a, b, R_out, eps,
-                                          fwd, bwd_a, bwd_b)
+    name, attribute = _BMM[bilinear]
+    Ra, Rb = PRODUCT_RULES[name](a, b, R_out, eps, fwd, bwd_a, bwd_b, attribute=attribute)
+    return (torch.zeros_like(a) if Ra is None else Ra,
+            torch.zeros_like(b) if Rb is None else Rb)
 
 
 def compute_reduction_r_in(x, R_out, dim, keepdim, eps):
@@ -373,23 +379,20 @@ class TestSignStructure:
 # ---------------------------------------------------------------------------
 # Rule dispatch — composite expansion and zbox flag interaction.
 # These test the wiring from LRPConfig to the right rule per node,
-# through the ONE resolver the installers use (_resolve_family_rule).
+# through the one resolver the installers use (resolve).
 # ---------------------------------------------------------------------------
 
 import autolrp
-from autolrp import LRPConfig
-from autolrp.backward.rules import LINEAR_RULES, BMM_RULES
-from autolrp.backward.install import resolve_rule
+from autolrp import LRPConfig, on, LAYERNORM_NODES
+from autolrp.backward.rules import PRODUCT_RULES
+from autolrp.backward.resolve import resolve
 
 
-def _dispatch(cfg, node, registry=LINEAR_RULES, default='epsilon'):
-    """The installers' resolution, reduced to (rule_fn, kwargs).
-
-    Takes a config for readability at the call sites; the resolver
-    itself takes the rule mapping, since selection reads nothing else,
-    and returns None when the mapping says nothing about this node.
-    """
-    return resolve_rule(cfg.rule, node, registry)
+def _dispatch(cfg, node, registry=None, default=None):
+    """The installers' resolution, reduced to (rule_fn, kwargs). Takes a
+    config for readability at the call sites; the resolver itself takes
+    the rule mapping and finds the node's table from its name."""
+    return resolve(cfg.rule, node)
 
 
 def _two_conv_cnn():
@@ -408,10 +411,10 @@ class TestResolveRuleComposite:
     """``LRPConfig.composite()`` routes Conv→zplus, everything else→epsilon."""
 
     @pytest.mark.parametrize("node_name,registry,expected", [
-        ('ConvolutionBackward0', LINEAR_RULES, 'zplus'),
-        ('AddmmBackward0',       LINEAR_RULES, 'epsilon'),
-        ('MmBackward0',          LINEAR_RULES, 'epsilon'),
-        ('BmmBackward0',         BMM_RULES,    'epsilon'),
+        ('ConvolutionBackward0', PRODUCT_RULES, 'zplus'),
+        ('AddmmBackward0',       PRODUCT_RULES, 'epsilon'),
+        ('MmBackward0',          PRODUCT_RULES, 'epsilon'),
+        ('BmmBackward0',         PRODUCT_RULES, 'epsilon'),
     ])
     def test_composite_dispatch(self, node_name, registry, expected):
         class _FakeNode:
@@ -574,14 +577,15 @@ class TestFusedLayerNormEqualsDecomposed:
     def test_identity_matches_statistical_route(self):
         dec, fused, run = self._pair()
         r_dec = run(dec, LRPConfig())                            # statistic_operand detaches mean and std
-        r_fus = run(fused, LRPConfig(layernorm='identity'))
+        r_fus = run(fused, LRPConfig())
         torch.testing.assert_close(r_fus, r_dec, atol=1e-6, rtol=0)
 
     def test_detach_std_matches_std_only_detached(self):
         dec, fused, run = self._pair()
         no_stat = {k: v for k, v in BASE.items() if k != 'statistic_operand'}
         r_dec = run(dec, LRPConfig(rule={**no_stat, 'SubBackward': 'proportional',
-                                          'DivBackward': 'detach_rhs', 'MulBackward': 'detach_rhs'}))
-        r_fus = run(fused, LRPConfig(layernorm='detach_std'))
+                                          'DivBackward': ('proportional', {'attribute': 'lhs'}),
+                                          'MulBackward': ('proportional', {'attribute': 'lhs'})}))
+        r_fus = run(fused, LRPConfig(rule={**BASE, **on(LAYERNORM_NODES, 'detach_std')}))
         torch.testing.assert_close(r_fus, r_dec, atol=1e-6, rtol=0)
         assert abs(float(r_fus.sum()) - float(r_dec.sum())) < 1e-6   # and both conserve alike
