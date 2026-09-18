@@ -110,14 +110,12 @@ pass already built:
   <img src="https://raw.githubusercontent.com/Wa-lead/autoLRP/main/assets/pipeline.png?v=4" width="100%">
 </p>
 
-1. **wrap.** `autolrp.tensor(x)` marks the input. A handful of ops are replaced
-   by versions that save the activations the rules need, and fused attention is
-   written out as ordinary ops. Gradients stay native, so the graph is
+1. **wrap.** `autolrp.tensor(x)` marks the input. Some of ops are replaced
+   by modified versions that save additional context the rules need. Gradients stay native, so the graph is
    otherwise unchanged.
 2. **walk.** After the forward pass, the autograd graph is traversed into an
    ordered plan of nodes.
-3. **analyze.** Analyzers tag nodes with *facts*, for example which operand of
-   an attention product is the softmax weights.
+3. **analyze.** Analyzers tag nodes with *facts*, where facts are captured graph semantics.
 4. **resolve.** Each node gets one rule, chosen by the config from a fact on the
    node when it has one, otherwise from the node name.
 5. **backward.** One pass back to the wrapped input runs those rules as hooks
